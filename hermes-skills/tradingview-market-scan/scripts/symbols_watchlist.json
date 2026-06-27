@@ -1,0 +1,44 @@
+{
+  "america": [
+    "NASDAQ:NDX",
+    "NASDAQ:NVDA",
+    "NASDAQ:MU",
+    "BOATS:DRAM",
+    "NASDAQ:MRVL",
+    "NASDAQ:AVGO",
+    "NYSE:TSM",
+    "NASDAQ:SNDK",
+    "NASDAQ:AMD",
+    "NASDAQ:MSFT",
+    "NASDAQ:AMZN",
+    "NYSE:CRCL",
+    "NASDAQ:META",
+    "NASDAQ:TSLA",
+    "NYSE:ASX",
+    "NYSE:GLW",
+    "NASDAQ:AAPL",
+    "NASDAQ:GOOGL",
+    "NASDAQ:MSTR"
+  ],
+  "china": [
+    "SSE:000001",
+    "SSE:600519"
+  ],
+  "hongkong": [
+    "HKEX:700",
+    "HKEX:1810"
+  ],
+  "korea": [
+    "KRX:000660"
+  ],
+  "crypto": [
+    "COINBASE:BTCUSD"
+  ],
+  "futures": [
+    "CME:BTC1!"
+  ],
+  "cfd": [
+    "OANDA:XAUUSD",
+    "TVC:SILVER"
+  ]
+}
