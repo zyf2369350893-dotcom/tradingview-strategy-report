@@ -7,10 +7,10 @@ on:
       - 'hermes-skills/tradingview-market-scan/scripts/**'
       - 'requirements.txt'
   schedule:
-    # Beijing 06:30 Monday-Saturday = UTC 22:30 Sunday-Friday
-    - cron: '30 22 * * 0-5'
-    # Beijing 06:30 Sunday = UTC 22:30 Saturday
-    - cron: '30 22 * * 6'
+    # Beijing 06:30 Monday-Friday = UTC 22:30 Sunday-Thursday
+    - cron: '30 22 * * 0-4'
+    # Beijing 07:00 Saturday weekly report = UTC 23:00 Friday
+    - cron: '0 23 * * 5'
   workflow_dispatch:
     inputs:
       report_type:
@@ -54,7 +54,7 @@ jobs:
           elif [[ "${{ github.event_name }}" == "push" ]]; then
             echo "type=daily" >> "$GITHUB_OUTPUT"
             echo "dry_run=true" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ github.event.schedule }}" == "30 22 * * 6" ]]; then
+          elif [[ "${{ github.event.schedule }}" == "0 23 * * 5" ]]; then
             echo "type=weekly" >> "$GITHUB_OUTPUT"
             echo "dry_run=false" >> "$GITHUB_OUTPUT"
           else
@@ -77,3 +77,4 @@ jobs:
             args+=(--dry-run)
           fi
           python hermes-skills/tradingview-market-scan/scripts/send_strategy_report.py "${args[@]}"
+
