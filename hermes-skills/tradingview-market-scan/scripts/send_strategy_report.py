@@ -90,11 +90,13 @@ def zh_kdj_note(note: object) -> str:
         return "-"
     if text in KDJ_NOTE_LABELS:
         return KDJ_NOTE_LABELS[text]
-    match = re.fullmatch(r"J(-?[\d.]+)->(-?[\d.]+) (.+)", text)
+    match = re.fullmatch(r"J(-?[\d.]+)->(-?[\d.]+)(?: (.+))?", text)
     if match:
         prev_j, j_value, tag = match.groups()
-        suffix = KDJ_NOTE_LABELS.get(tag, tag)
-        return f"J值 {prev_j} 变为 {j_value}，{suffix}"
+        if tag:
+            suffix = KDJ_NOTE_LABELS.get(tag, tag)
+            return f"J值 {prev_j} 变为 {j_value}，{suffix}"
+        return f"J值 {prev_j} 变为 {j_value}"
     return text
 
 
@@ -387,4 +389,5 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
+
 
