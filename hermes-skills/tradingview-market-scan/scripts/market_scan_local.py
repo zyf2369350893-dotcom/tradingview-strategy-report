@@ -1,4 +1,4 @@
-
+﻿
 #!/usr/bin/env python3
 """Full OHLCV local recalculation scanner for the TradingView watch universe.
 
@@ -92,9 +92,10 @@ def tv_to_yahoo(symbol: str) -> str | None:
 class Thresholds:
     dense_atr: float = 2.05
     dense_price_atr: float = 0.50
-    pullback_approach_atr: float = 0.75
+    pullback_approach_atr: float = 0.35
+    pullback_approach_pct: float = 0.03
     pullback_break_low_atr: float = 0.35
-    pullback_break_close_atr: float = 0.15
+    pullback_break_close_atr: float = 0.25
     max_items_per_section: int = 30
 
 
@@ -435,45 +436,64 @@ def classify_frame(tv_symbol: str, yahoo: str, market: str, df: pd.DataFrame, th
     group120_low, group120_high = min(ma120, ema120), max(ma120, ema120)
     uptrend = group20_low > group60_high and group60_low > group120_high and close > group120_high
 
-    def enters(group_low: float, group_high: float) -> bool:
-        near_from_above = low <= group_high + atr * th.pullback_approach_atr
+    def approach_band(group_high: float) -> float:
+        return min(atr * th.pullback_approach_atr, group_high * th.pullback_approach_pct)
+
+    def zone_distance(value: float, group_low: float, group_high: float) -> float:
+        if group_low <= value <= group_high:
+            return 0.0
+        return min(abs(value - group_low), abs(value - group_high))
+
+    def pullback_candidate(kind: str, period: int, group_low: float, group_high: float) -> dict[str, float | int | str] | None:
+        band = approach_band(group_high)
+        near_from_above = low <= group_high + band
         not_broken = low >= group_low - atr * th.pullback_break_low_atr and close >= group_low - atr * th.pullback_break_close_atr
-        return near_from_above and not_broken
-
-    def fresh(group_high: float) -> bool:
-        return prev_low is not None and prev_low > group_high + atr * th.pullback_approach_atr
-
-    def pullback_score(group_high: float) -> int:
-        distance_atr = max(0.0, (low - group_high) / atr)
-        score = 44 + 15 + max(0, 10 - distance_atr * 12)
+        first_near = prev_low is not None and prev_low > group_high + band
+        touched_zone = low <= group_high
+        if not (uptrend and near_from_above and not_broken and (first_near or touched_zone)):
+            return None
+        close_distance_atr = zone_distance(close, group_low, group_high) / atr
+        low_distance_atr = zone_distance(low, group_low, group_high) / atr
+        score = 44 + 15 + max(0, 10 - close_distance_atr * 12)
         score += kdj_j_bonus(j, 35)
         if j_hook:
             score += 15
         if change and change > 0:
             score += 3
         score += macd_div_score
-        return clamp_score(score)
+        return {
+            "kind": kind,
+            "period": period,
+            "group_low": group_low,
+            "group_high": group_high,
+            "close_distance_atr": close_distance_atr,
+            "low_distance_atr": low_distance_atr,
+            "score": clamp_score(score),
+        }
 
-    if uptrend and enters(group20_low, group20_high) and fresh(group20_high):
+    pullbacks = [
+        item for item in [
+            pullback_candidate(PULL20, 20, group20_low, group20_high),
+            pullback_candidate(PULL60, 60, group60_low, group60_high),
+        ]
+        if item is not None
+    ]
+    if pullbacks:
+        nearest = min(pullbacks, key=lambda item: (float(item["close_distance_atr"]), float(item["low_distance_atr"]), int(item["period"])))
         candidates.append(Candidate(
-            kind=PULL20,
-            reason=f"uptrend, first near MA/EMA20 zone {group20_low:.2f}-{group20_high:.2f}",
-            score=pullback_score(group20_high),
-            kdj_note=note,
-            fresh_pullback=True,
-            **base,
-        ))
-    if uptrend and enters(group60_low, group60_high) and fresh(group60_high):
-        candidates.append(Candidate(
-            kind=PULL60,
-            reason=f"uptrend, first near MA/EMA60 zone {group60_low:.2f}-{group60_high:.2f}",
-            score=pullback_score(group60_high),
+            kind=str(nearest["kind"]),
+            reason=(
+                f"uptrend, nearest MA/EMA{int(nearest['period'])} zone "
+                f"{float(nearest['group_low']):.2f}-{float(nearest['group_high']):.2f}, "
+                f"close distance {float(nearest['close_distance_atr']):.2f}ATR, "
+                f"low distance {float(nearest['low_distance_atr']):.2f}ATR"
+            ),
+            score=int(nearest["score"]),
             kdj_note=note,
             fresh_pullback=True,
             **base,
         ))
     return candidates
-
 
 def scan(symbol_file: Path, timeframe: str, th: Thresholds, crypto_dense_only: bool = False, bars: int = 420) -> dict[str, Any]:
     try:

@@ -132,7 +132,14 @@ def zh_reason(reason: object) -> str:
     if pull:
         period, low, high = pull.groups()
         return f"上涨趋势中，首次接近 MA/EMA{period} 区间 {low}-{high}"
-    return text.replace("uptrend", "上涨趋势").replace("first near", "首次接近").replace("zone", "区间")
+    nearest = re.fullmatch(
+        r"uptrend, nearest MA/EMA(20|60) zone ([\d.]+)-([\d.]+), close distance ([\d.]+)ATR, low distance ([\d.]+)ATR",
+        text,
+    )
+    if nearest:
+        period, low, high, close_distance, low_distance = nearest.groups()
+        return f"上涨趋势中，当前价格最近的是 MA/EMA{period} 区间 {low}-{high}；收盘距离 {close_distance}ATR，最低价距离 {low_distance}ATR"
+    return text.replace("uptrend", "上涨趋势").replace("first near", "首次接近").replace("nearest", "最近").replace("zone", "区间")
 
 
 def result_rows(result: dict[str, object], sections: list[str]) -> list[dict[str, object]]:
@@ -389,5 +396,6 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
+
 
 
