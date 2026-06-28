@@ -1,10 +1,11 @@
-
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Generate and email the local-recalc strategy report."""
 from __future__ import annotations
 
 import argparse
+import html
 import os
+import re
 import smtplib
 import sys
 from datetime import datetime
@@ -19,9 +20,33 @@ WATCHLIST = ROOT / "symbols_watchlist.json"
 CRYPTO = ROOT / "symbols_crypto.json"
 
 SECTION_LABELS = {
-    DENSE: "MA Dense",
-    PULL20: "Pullback 20",
-    PULL60: "Pullback 60",
+    DENSE: "均线密集",
+    PULL20: "回踩20日均线",
+    PULL60: "回踩60日均线",
+}
+
+MACD_LABELS = {
+    "DIF>=DEA": "DIF在DEA上方",
+    "DIF<DEA": "DIF在DEA下方",
+}
+
+DIV_LABELS = {
+    "MACD_BULL_DIV": "MACD底背离",
+    "MACD_HIDDEN_BULL_DIV": "MACD隐藏底背离",
+    "DIF_BULL_DIV": "DIF底背离",
+    "HIST_BULL_DIV": "柱体底背离",
+    "MACD_BEAR_DIV": "MACD顶背离压力",
+    "DIF_BEAR_DIV": "DIF顶背离压力",
+    "HIST_BEAR_DIV": "柱体顶背离压力",
+}
+
+KDJ_NOTE_LABELS = {
+    "KDJ no data": "KDJ数据不足",
+    "J<0": "J<0 极度低位",
+    "J<0 hook": "J<0 低位勾头",
+    "J<20": "J<20 低位",
+    "J<20 hook": "J<20 低位勾头",
+    "J hook": "J值勾头",
 }
 
 
@@ -43,27 +68,69 @@ def fmt_pct(value: object) -> str:
         return "-"
 
 
-def section_table(title: str, rows: list[dict[str, object]]) -> list[str]:
-    lines = [f"### {title}"]
-    if not rows:
-        lines.append("None")
-        lines.append("")
-        return lines
-    lines.append("| Rank | Symbol | Type | Close | Change | Score | J | MACD | Notes |")
-    lines.append("|---:|---|---|---:|---:|---:|---:|---|---|")
-    for idx, row in enumerate(rows, 1):
-        note = str(row.get("kdj_note") or "")
-        macd_div = str(row.get("macd_divergence") or "")
-        reason = str(row.get("reason") or "")
-        desc = "; ".join(part for part in [note, macd_div, reason] if part)
-        kind = SECTION_LABELS.get(str(row.get("kind")), str(row.get("kind") or "-"))
-        lines.append(
-            f"| {idx} | {row.get('symbol')} | {kind} | {fmt_float(row.get('close'))} | "
-            f"{fmt_pct(row.get('change'))} | {row.get('score')} | {fmt_float(row.get('j'), 1)} | "
-            f"{row.get('macd') or '-'} | {desc} |"
-        )
-    lines.append("")
-    return lines
+def esc(value: object) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def zh_timeframe(report_type: str) -> str:
+    return "周线" if report_type == "weekly" else "日线"
+
+
+def zh_report_name(report_type: str) -> str:
+    return "周报" if report_type == "weekly" else "日报"
+
+
+def zh_kind(kind: object) -> str:
+    return SECTION_LABELS.get(str(kind), str(kind or "-"))
+
+
+def zh_kdj_note(note: object) -> str:
+    text = str(note or "").strip()
+    if not text:
+        return "-"
+    if text in KDJ_NOTE_LABELS:
+        return KDJ_NOTE_LABELS[text]
+    match = re.fullmatch(r"J(-?[\d.]+)->(-?[\d.]+) (.+)", text)
+    if match:
+        prev_j, j_value, tag = match.groups()
+        suffix = KDJ_NOTE_LABELS.get(tag, tag)
+        return f"J值 {prev_j} 变为 {j_value}，{suffix}"
+    return text
+
+
+def zh_macd(macd: object) -> str:
+    text = str(macd or "").strip()
+    return MACD_LABELS.get(text, text or "-")
+
+
+def zh_divergence(divergence: object) -> str:
+    text = str(divergence or "").strip()
+    if not text:
+        return "-"
+    match = re.fullmatch(r"([A-Z_]+)@(\d+)bars", text)
+    if not match:
+        return DIV_LABELS.get(text, text)
+    key, bars = match.groups()
+    label = DIV_LABELS.get(key, key)
+    return f"{label}（{bars}根K线前确认）"
+
+
+def zh_reason(reason: object) -> str:
+    text = str(reason or "").strip()
+    if not text:
+        return "-"
+    dense = re.fullmatch(
+        r"six-line width ([\d.]+)ATR, price distance ([\d.]+)ATR, close above 20 group",
+        text,
+    )
+    if dense:
+        width, distance = dense.groups()
+        return f"六线跨度 {width}ATR，价格距密集区 {distance}ATR，收盘价站上20日均线组"
+    pull = re.fullmatch(r"uptrend, first near MA/EMA(20|60) zone ([\d.]+)-([\d.]+)", text)
+    if pull:
+        period, low, high = pull.groups()
+        return f"上涨趋势中，首次接近 MA/EMA{period} 区间 {low}-{high}"
+    return text.replace("uptrend", "上涨趋势").replace("first near", "首次接近").replace("zone", "区间")
 
 
 def result_rows(result: dict[str, object], sections: list[str]) -> list[dict[str, object]]:
@@ -78,66 +145,200 @@ def result_rows(result: dict[str, object], sections: list[str]) -> list[dict[str
     return out
 
 
-def build_report(report_type: str, max_items: int) -> tuple[str, str]:
+def missing_text(result: dict[str, object]) -> str:
+    missing = result.get("missing_symbols") or []
+    if not missing:
+        return "无"
+    return "、".join(str(item) for item in missing)
+
+
+def plain_candidates(title: str, rows: list[dict[str, object]]) -> list[str]:
+    lines = [title]
+    if not rows:
+        return lines + ["暂无符合条件标的", ""]
+    for idx, row in enumerate(rows, 1):
+        parts = [
+            f"{idx}. {row.get('symbol')}｜{zh_kind(row.get('kind'))}｜评分 {row.get('score')}",
+            f"收盘 {fmt_float(row.get('close'))}｜涨跌 {fmt_pct(row.get('change'))}｜J {fmt_float(row.get('j'), 1)}",
+            f"KDJ：{zh_kdj_note(row.get('kdj_note'))}",
+            f"MACD：{zh_macd(row.get('macd'))}；{zh_divergence(row.get('macd_divergence'))}",
+            f"原因：{zh_reason(row.get('reason'))}",
+        ]
+        lines.extend(parts)
+        lines.append("")
+    return lines
+
+
+def card_html(row: dict[str, object], idx: int) -> str:
+    score = esc(row.get("score"))
+    symbol = esc(row.get("symbol"))
+    name = esc(row.get("name") or "")
+    kind = esc(zh_kind(row.get("kind")))
+    close = esc(fmt_float(row.get("close")))
+    change = esc(fmt_pct(row.get("change")))
+    j_value = esc(fmt_float(row.get("j"), 1))
+    kdj = esc(zh_kdj_note(row.get("kdj_note")))
+    macd = esc(zh_macd(row.get("macd")))
+    div = esc(zh_divergence(row.get("macd_divergence")))
+    reason = esc(zh_reason(row.get("reason")))
+    change_color = "#b42318" if str(change).startswith("-") else "#067647"
+    return f"""
+      <div style="border:1px solid #e5e7eb;border-radius:8px;padding:14px 14px 12px;margin:10px 0;background:#ffffff;">
+        <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
+          <div>
+            <div style="font-size:17px;font-weight:700;color:#111827;">#{idx} {symbol}</div>
+            <div style="font-size:12px;color:#6b7280;margin-top:2px;">{name}</div>
+          </div>
+          <div style="text-align:right;">
+            <div style="font-size:12px;color:#6b7280;">评分</div>
+            <div style="font-size:22px;font-weight:800;color:#111827;line-height:1;">{score}</div>
+          </div>
+        </div>
+        <div style="margin-top:10px;">
+          <span style="display:inline-block;background:#eef2ff;color:#3730a3;border-radius:999px;padding:4px 9px;font-size:12px;font-weight:700;">{kind}</span>
+          <span style="display:inline-block;background:#f3f4f6;color:#374151;border-radius:999px;padding:4px 9px;font-size:12px;margin-left:4px;">KDJ：{kdj}</span>
+        </div>
+        <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;margin-top:12px;border-collapse:collapse;font-size:13px;color:#374151;">
+          <tr>
+            <td style="padding:5px 0;color:#6b7280;">收盘价</td>
+            <td style="padding:5px 0;text-align:right;font-weight:700;color:#111827;">{close}</td>
+          </tr>
+          <tr>
+            <td style="padding:5px 0;color:#6b7280;">涨跌幅</td>
+            <td style="padding:5px 0;text-align:right;font-weight:700;color:{change_color};">{change}</td>
+          </tr>
+          <tr>
+            <td style="padding:5px 0;color:#6b7280;">J值</td>
+            <td style="padding:5px 0;text-align:right;font-weight:700;color:#111827;">{j_value}</td>
+          </tr>
+          <tr>
+            <td style="padding:5px 0;color:#6b7280;">MACD辅助</td>
+            <td style="padding:5px 0;text-align:right;color:#111827;">{macd}；{div}</td>
+          </tr>
+        </table>
+        <div style="margin-top:10px;padding-top:10px;border-top:1px solid #f3f4f6;font-size:13px;line-height:1.55;color:#374151;">
+          <strong style="color:#111827;">入选原因：</strong>{reason}
+        </div>
+      </div>
+    """
+
+
+def cards_html(rows: list[dict[str, object]]) -> str:
+    if not rows:
+        return '<div style="border:1px dashed #d1d5db;border-radius:8px;padding:14px;color:#6b7280;background:#f9fafb;">暂无符合条件标的</div>'
+    return "\n".join(card_html(row, idx) for idx, row in enumerate(rows, 1))
+
+
+def section_html(title: str, result: dict[str, object], rows: list[dict[str, object]]) -> str:
+    returned = esc(result.get("rows_count"))
+    total = esc(result.get("symbols_count"))
+    missing = esc(missing_text(result))
+    return f"""
+      <section style="margin-top:22px;">
+        <h2 style="font-size:18px;margin:0 0 10px;color:#111827;">{esc(title)}</h2>
+        <div style="font-size:13px;color:#4b5563;margin-bottom:10px;">
+          数据返回：<strong>{returned}/{total}</strong>　未返回/数据不足：<strong>{missing}</strong>
+        </div>
+        {cards_html(rows)}
+      </section>
+    """
+
+
+def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
     timeframe = "weekly" if report_type == "weekly" else "daily"
     th = Thresholds(max_items_per_section=max_items)
     watch = scan(WATCHLIST, timeframe, th, crypto_dense_only=False)
     crypto = scan(CRYPTO, timeframe, th, crypto_dense_only=True)
     now = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
-    label = "Weekly" if report_type == "weekly" else "Daily"
-    subject = f"TradingView Strategy {label} Report | {now} CST"
+    report_name = zh_report_name(report_type)
+    timeframe_name = zh_timeframe(report_type)
+    subject = f"TradingView策略{report_name}｜{timeframe_name}｜{now} 北京时间"
 
     watch_rows = result_rows(watch, [DENSE, PULL20, PULL60])
     crypto_rows = result_rows(crypto, [DENSE])
 
-    watch_missing = ", ".join(watch.get("missing_symbols") or []) or "None"
-    crypto_missing = ", ".join(crypto.get("missing_symbols") or []) or "None"
-
-    lines = [
-        f"# TradingView Strategy {label} Report",
+    plain_lines = [
+        f"TradingView策略{report_name}",
+        f"生成时间：{now} 北京时间",
+        f"周期：{timeframe_name}",
+        "数据源：Yahoo Finance/yfinance 完整K线；SMA/EMA、KDJ、MACD由本地重新计算",
         "",
-        f"Generated: {now} Beijing time",
-        f"Timeframe: {'weekly' if timeframe == 'weekly' else 'daily'}",
-        "Source: yfinance OHLCV; local recalculation for SMA/EMA, KDJ and MACD",
+        "筛选优先级：",
+        "1. 自选列表：均线密集优先，且J值越小越加分。",
+        "2. 回踩20日与60日均线并列第二，J值越小权重越高。",
+        "3. MACD背离仅作为辅助评分，不做硬筛选。",
+        "4. 加密列表：目前只看均线密集；密集后J<0作为加分项。",
         "",
-        "Priority rules:",
-        "1. Watchlist: MA dense first; lower J is better.",
-        "2. Pullback 20 and Pullback 60 are tied second; lower J has high weight.",
-        "3. MACD divergence is only an auxiliary score.",
-        "4. Crypto: MA dense only; J<0 is a bonus.",
-        "",
-        "## Watchlist",
-        f"Data returned: {watch.get('rows_count')}/{watch.get('symbols_count')}",
-        f"Missing / insufficient data: {watch_missing}",
-        "",
+        f"自选列表：数据返回 {watch.get('rows_count')}/{watch.get('symbols_count')}；未返回/数据不足：{missing_text(watch)}",
     ]
-    lines.extend(section_table("Watchlist Candidates", watch_rows))
-    lines.extend([
-        "## Crypto",
-        f"Data returned: {crypto.get('rows_count')}/{crypto.get('symbols_count')}",
-        f"Missing / insufficient data: {crypto_missing}",
-        "",
-    ])
-    lines.extend(section_table("Crypto MA Dense", crypto_rows))
+    plain_lines.extend(plain_candidates("自选列表候选", watch_rows))
+    plain_lines.append(f"加密列表：数据返回 {crypto.get('rows_count')}/{crypto.get('symbols_count')}；未返回/数据不足：{missing_text(crypto)}")
+    plain_lines.extend(plain_candidates("加密列表均线密集", crypto_rows))
 
     errors = list(watch.get("errors") or []) + list(crypto.get("errors") or [])
     if errors:
-        lines.append("## Data Notes")
+        plain_lines.append("数据备注：")
         for err in errors[:20]:
-            lines.append(f"- {err}")
+            plain_lines.append(f"- {err}")
         if len(errors) > 20:
-            lines.append(f"- {len(errors) - 20} more notes")
-        lines.append("")
+            plain_lines.append(f"- 另有 {len(errors) - 20} 条备注")
+        plain_lines.append("")
 
-    lines.extend([
-        "## Risk Notice",
-        "This is a technical screening report only, not investment advice. Check live broker/exchange data before any trade.",
+    plain_lines.extend([
+        "风险提醒：本报告只是技术筛选和复盘参考，不构成买卖建议。实际交易前请再核对券商/交易所实时行情、流动性和自身风险承受能力。",
         "",
     ])
-    return subject, "\n".join(lines)
+    plain_body = "\n".join(plain_lines)
+
+    error_html = ""
+    if errors:
+        items = "".join(f"<li>{esc(err)}</li>" for err in errors[:20])
+        more = f"<li>另有 {len(errors) - 20} 条备注</li>" if len(errors) > 20 else ""
+        error_html = f"""
+          <section style="margin-top:22px;">
+            <h2 style="font-size:18px;margin:0 0 10px;color:#111827;">数据备注</h2>
+            <ul style="margin:0;padding-left:18px;color:#4b5563;font-size:13px;line-height:1.55;">{items}{more}</ul>
+          </section>
+        """
+
+    html_body = f"""<!doctype html>
+<html>
+  <body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,'Microsoft YaHei',sans-serif;color:#111827;">
+    <div style="max-width:680px;margin:0 auto;padding:18px 12px;">
+      <div style="background:#111827;color:#ffffff;border-radius:10px;padding:18px 16px;">
+        <div style="font-size:13px;opacity:.78;">{esc(now)} 北京时间</div>
+        <h1 style="font-size:22px;line-height:1.25;margin:6px 0 0;">TradingView策略{esc(report_name)}</h1>
+        <div style="font-size:14px;margin-top:8px;opacity:.9;">周期：{esc(timeframe_name)}｜完整K线本地重算</div>
+      </div>
+
+      <div style="background:#ffffff;border-radius:10px;margin-top:12px;padding:14px 16px;border:1px solid #e5e7eb;">
+        <div style="font-size:15px;font-weight:700;margin-bottom:8px;">筛选优先级</div>
+        <ol style="margin:0;padding-left:20px;color:#374151;font-size:13px;line-height:1.65;">
+          <li>自选列表：均线密集优先，且J值越小越加分。</li>
+          <li>回踩20日与60日均线并列第二，J值越小权重越高。</li>
+          <li>MACD背离仅作为辅助评分，不做硬筛选。</li>
+          <li>加密列表：目前只看均线密集；密集后J&lt;0作为加分项。</li>
+        </ol>
+      </div>
+
+      {section_html("自选列表候选", watch, watch_rows)}
+      {section_html("加密列表均线密集", crypto, crypto_rows)}
+      {error_html}
+
+      <div style="margin-top:22px;background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:13px 15px;color:#9a3412;font-size:13px;line-height:1.6;">
+        <strong>风险提醒：</strong>本报告只是技术筛选和复盘参考，不构成买卖建议。实际交易前请再核对券商/交易所实时行情、流动性和自身风险承受能力。
+      </div>
+      <div style="margin:12px 2px 0;color:#6b7280;font-size:12px;line-height:1.5;">
+        数据源：Yahoo Finance/yfinance 完整K线；SMA/EMA、KDJ、MACD由脚本本地重新计算。
+      </div>
+    </div>
+  </body>
+</html>"""
+
+    return subject, plain_body, html_body
 
 
-def send_email(subject: str, body: str, dry_run: bool = False) -> bool:
+def send_email(subject: str, plain_body: str, html_body: str, dry_run: bool = False) -> bool:
     host = os.environ.get("SMTP_HOST")
     port = int(os.environ.get("SMTP_PORT", "587"))
     user = os.environ.get("SMTP_USER")
@@ -147,16 +348,18 @@ def send_email(subject: str, body: str, dry_run: bool = False) -> bool:
     use_tls = os.environ.get("SMTP_TLS", "true").lower() != "false"
 
     if dry_run or not all([host, user, password, mail_from, mail_to]):
-        print("[DRY-RUN] Email not sent. Set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, MAIL_FROM, MAIL_TO to send.")
+        print("[DRY-RUN] 邮件未发送；已生成中文 HTML 邮件。")
         print("Subject:", subject)
-        print(body)
+        print(plain_body)
+        print(f"[DRY-RUN] HTML length: {len(html_body)} bytes")
         return False
 
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = mail_from
     msg["To"] = mail_to
-    msg.set_content(body, subtype="plain", charset="utf-8")
+    msg.set_content(plain_body, subtype="plain", charset="utf-8")
+    msg.add_alternative(html_body, subtype="html", charset="utf-8")
 
     with smtplib.SMTP(host, port, timeout=30) as smtp:
         if use_tls:
@@ -177,10 +380,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    subject, body = build_report(args.report_type, args.max_items)
-    send_email(subject, body, dry_run=args.dry_run)
+    subject, plain_body, html_body = build_report(args.report_type, args.max_items)
+    send_email(subject, plain_body, html_body, dry_run=args.dry_run)
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
+
