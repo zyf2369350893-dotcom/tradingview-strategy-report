@@ -18,11 +18,18 @@
     "NYSE:GLW",
     "NASDAQ:AAPL",
     "NASDAQ:GOOGL",
-    "NASDAQ:MSTR"
+    "NASDAQ:MSTR",
+    "NYSE:RDDT",
+    "NASDAQ:HIMX",
+    "NASDAQ:LITE",
+    "NASDAQ:SPCX"
   ],
   "china": [
     "SSE:000001",
-    "SSE:600519"
+    "SSE:600519",
+    "SSE:588170",
+    "SSE:561980",
+    "SSE:560780"
   ],
   "hongkong": [
     "HKEX:700",
