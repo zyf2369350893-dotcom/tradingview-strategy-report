@@ -1,4 +1,3 @@
-﻿
 #!/usr/bin/env python3
 """Full OHLCV local recalculation scanner for the TradingView watch universe.
 
@@ -65,6 +64,7 @@ YAHOO_OVERRIDES = {
     "BINANCE:NEIROUSDT": "NEIRO-USD",
     "CME:BTC1!": "BTC=F",
     "OANDA:XAUUSD": "GC=F",
+    "OANDA:XAGUSD": "SI=F",
     "TVC:SILVER": "SI=F",
 }
 
@@ -92,8 +92,10 @@ def tv_to_yahoo(symbol: str) -> str | None:
 class Thresholds:
     dense_atr: float = 2.05
     dense_price_atr: float = 0.50
+    dense_width_pct: float = 0.08
     pullback_approach_atr: float = 0.35
     pullback_approach_pct: float = 0.03
+    pullback_close_above_atr: float = 0.00
     pullback_break_low_atr: float = 0.35
     pullback_break_close_atr: float = 0.25
     max_items_per_section: int = 30
@@ -385,6 +387,7 @@ def classify_frame(tv_symbol: str, yahoo: str, market: str, df: pd.DataFrame, th
     line_high = max(lines)
     line_low = min(lines)
     density = (line_high - line_low) / atr
+    width_pct = (line_high - line_low) / close
     price_dist = 0.0 if line_low <= close <= line_high else min(abs(close - line_low), abs(close - line_high)) / atr
     j = clean_float(row["J"])
     prev_j = clean_float(prev["J"])
@@ -417,12 +420,12 @@ def classify_frame(tv_symbol: str, yahoo: str, market: str, df: pd.DataFrame, th
     )
     candidates: list[Candidate] = []
     above_20_group = close > max(ma20, ema20)
-    if above_20_group and density <= th.dense_atr and price_dist <= th.dense_price_atr:
+    if above_20_group and density <= th.dense_atr and width_pct <= th.dense_width_pct and price_dist <= th.dense_price_atr:
         kdj_bonus = kdj_j_bonus(j, 35)
         score = clamp_score(100 - (density / th.dense_atr) * 45 - (price_dist / th.dense_price_atr) * 30 + kdj_bonus + (5 if change and change > 0 else 0) + macd_div_score)
         candidates.append(Candidate(
             kind=DENSE,
-            reason=f"six-line width {density:.2f}ATR, price distance {price_dist:.2f}ATR, close above 20 group",
+            reason=f"six-line width {density:.2f}ATR/{width_pct * 100:.1f}%, price distance {price_dist:.2f}ATR, close above 20 group",
             score=score,
             kdj_note=note,
             **base,
@@ -450,7 +453,8 @@ def classify_frame(tv_symbol: str, yahoo: str, market: str, df: pd.DataFrame, th
         not_broken = low >= group_low - atr * th.pullback_break_low_atr and close >= group_low - atr * th.pullback_break_close_atr
         first_near = prev_low is not None and prev_low > group_high + band
         touched_zone = low <= group_high
-        if not (uptrend and near_from_above and not_broken and (first_near or touched_zone)):
+        close_still_in_zone = close <= group_high + atr * th.pullback_close_above_atr
+        if not (uptrend and near_from_above and not_broken and close_still_in_zone and (first_near or touched_zone)):
             return None
         close_distance_atr = zone_distance(close, group_low, group_high) / atr
         low_distance_atr = zone_distance(low, group_low, group_high) / atr

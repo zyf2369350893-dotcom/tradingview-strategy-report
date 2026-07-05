@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Generate and email the local-recalc strategy report."""
 from __future__ import annotations
 
@@ -121,6 +121,13 @@ def zh_reason(reason: object) -> str:
     text = str(reason or "").strip()
     if not text:
         return "-"
+    dense_pct = re.fullmatch(
+        r"six-line width ([\d.]+)ATR/([\d.]+)%, price distance ([\d.]+)ATR, close above 20 group",
+        text,
+    )
+    if dense_pct:
+        width, width_pct, distance = dense_pct.groups()
+        return f"六线跨度 {width}ATR / {width_pct}%，价格距密集区 {distance}ATR，收盘价站上20日均线组"
     dense = re.fullmatch(
         r"six-line width ([\d.]+)ATR, price distance ([\d.]+)ATR, close above 20 group",
         text,
@@ -273,7 +280,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
         "数据源：Yahoo Finance/yfinance 完整K线；SMA/EMA、KDJ、MACD由本地重新计算",
         "",
         "筛选优先级：",
-        "1. 自选列表：均线密集优先，且J值越小越加分。",
+        "1. 自选列表：均线密集需同时满足 ATR 压缩和六线跨度占比，且J值越小越加分。",
         "2. 回踩20日与60日均线并列第二，J值越小权重越高。",
         "3. MACD背离仅作为辅助评分，不做硬筛选。",
         "4. 加密列表：目前只看均线密集；密集后J<0作为加分项。",
@@ -323,7 +330,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
       <div style="background:#ffffff;border-radius:10px;margin-top:12px;padding:14px 16px;border:1px solid #e5e7eb;">
         <div style="font-size:15px;font-weight:700;margin-bottom:8px;">筛选优先级</div>
         <ol style="margin:0;padding-left:20px;color:#374151;font-size:13px;line-height:1.65;">
-          <li>自选列表：均线密集优先，且J值越小越加分。</li>
+          <li>自选列表：均线密集需同时满足 ATR 压缩和六线跨度占比，且J值越小越加分。</li>
           <li>回踩20日与60日均线并列第二，J值越小权重越高。</li>
           <li>MACD背离仅作为辅助评分，不做硬筛选。</li>
           <li>加密列表：目前只看均线密集；密集后J&lt;0作为加分项。</li>
@@ -396,6 +403,3 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
-
-
-
