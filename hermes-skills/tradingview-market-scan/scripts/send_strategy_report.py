@@ -13,13 +13,24 @@ from email.message import EmailMessage
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from market_scan_local import DENSE, PULL20, PULL60, Thresholds, candidate_to_dict, scan
+from market_scan_local import (
+    DENSE,
+    KDJ_MAX_BONUS,
+    PULL20,
+    PULL60,
+    WEEKLY_J_LT_ZERO,
+    WEEKLY_J_LT_ZERO_EXTRA_BONUS,
+    Thresholds,
+    candidate_to_dict,
+    scan,
+)
 
 ROOT = Path(__file__).resolve().parent
 WATCHLIST = ROOT / "symbols_watchlist.json"
 CRYPTO = ROOT / "symbols_crypto.json"
 
 SECTION_LABELS = {
+    WEEKLY_J_LT_ZERO: "周线J<0高权重",
     DENSE: "均线密集",
     PULL20: "回踩20日均线",
     PULL60: "回踩60日均线",
@@ -160,6 +171,27 @@ def result_rows(result: dict[str, object], sections: list[str]) -> list[dict[str
             out.append(candidate_to_dict(cand))
     return out
 
+def weekly_j_lt_zero_rows(
+    watch: dict[str, object],
+    crypto: dict[str, object],
+    max_items: int,
+) -> list[dict[str, object]]:
+    combined = result_rows(watch, [WEEKLY_J_LT_ZERO]) + result_rows(crypto, [WEEKLY_J_LT_ZERO])
+    unique: dict[str, dict[str, object]] = {}
+    for row in combined:
+        symbol = str(row.get("symbol") or "")
+        if symbol and symbol not in unique:
+            unique[symbol] = row
+
+    def sort_key(row: dict[str, object]) -> tuple[float, str]:
+        try:
+            j_value = float(row.get("j"))
+        except (TypeError, ValueError):
+            j_value = float("inf")
+        return (j_value, str(row.get("symbol") or ""))
+
+    return sorted(unique.values(), key=sort_key)[:max_items]
+
 
 def missing_text(result: dict[str, object]) -> str:
     missing = result.get("missing_symbols") or []
@@ -260,6 +292,18 @@ def section_html(title: str, result: dict[str, object], rows: list[dict[str, obj
     """
 
 
+def weekly_priority_html(rows: list[dict[str, object]]) -> str:
+    total_weight = KDJ_MAX_BONUS + WEEKLY_J_LT_ZERO_EXTRA_BONUS
+    return f"""
+      <section style="margin-top:22px;background:#fffbeb;border:2px solid #f59e0b;border-radius:10px;padding:14px;">
+        <h2 style="font-size:18px;margin:0 0 8px;color:#92400e;">周线 KDJ J&lt;0 高权重关注</h2>
+        <div style="font-size:13px;color:#92400e;line-height:1.55;margin-bottom:10px;">
+          独立筛选全股票池，KDJ总权重 +{total_weight} 分，按J值从低到高排列；可能与下方常规候选重复。
+        </div>
+        {cards_html(rows)}
+      </section>
+    """
+
 def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
     timeframe = "weekly" if report_type == "weekly" else "daily"
     th = Thresholds(max_items_per_section=max_items)
@@ -272,6 +316,24 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
 
     watch_rows = result_rows(watch, [DENSE, PULL20, PULL60])
     crypto_rows = result_rows(crypto, [DENSE])
+    weekly_priority_rows = weekly_j_lt_zero_rows(watch, crypto, max_items) if report_type == "weekly" else []
+    total_weekly_kdj_weight = KDJ_MAX_BONUS + WEEKLY_J_LT_ZERO_EXTRA_BONUS
+
+    if report_type == "weekly":
+        priority_lines = [
+            f"1. 周线J<0：独立筛选全股票池，KDJ总权重 +{total_weekly_kdj_weight} 分，并在邮件置顶单列。",
+            "2. 自选列表：均线密集需同时满足 ATR 压缩和六线跨度占比，且J值越小越加分。",
+            "3. 回踩20周与60周均线并列，J值越小权重越高。",
+            "4. MACD背离仅作为辅助评分，不做硬筛选。",
+            "5. 加密列表的常规候选目前只看均线密集；周线J<0仍会进入置顶名单。",
+        ]
+    else:
+        priority_lines = [
+            f"1. 自选列表：均线密集需同时满足 ATR 压缩和六线跨度占比；J<20按深度加分，J<0时KDJ最高 +{KDJ_MAX_BONUS} 分。",
+            "2. 回踩20日与60日均线并列；J值权重同上，若J值向上勾头再加15分。",
+            "3. MACD背离仅作为辅助评分，不做硬筛选。",
+            "4. 加密列表：目前只看均线密集；密集后J<0作为加分项。",
+        ]
 
     plain_lines = [
         f"TradingView策略{report_name}",
@@ -280,13 +342,15 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
         "数据源：Yahoo Finance/yfinance 完整K线；SMA/EMA、KDJ、MACD由本地重新计算",
         "",
         "筛选优先级：",
-        "1. 自选列表：均线密集需同时满足 ATR 压缩和六线跨度占比，且J值越小越加分。",
-        "2. 回踩20日与60日均线并列第二，J值越小权重越高。",
-        "3. MACD背离仅作为辅助评分，不做硬筛选。",
-        "4. 加密列表：目前只看均线密集；密集后J<0作为加分项。",
+        *priority_lines,
         "",
         f"自选列表：数据返回 {watch.get('rows_count')}/{watch.get('symbols_count')}；未返回/数据不足：{missing_text(watch)}",
     ]
+    if report_type == "weekly":
+        plain_lines.extend(plain_candidates(
+            f"周线 KDJ J<0 高权重关注（KDJ总权重 +{total_weekly_kdj_weight}，按J值从低到高）",
+            weekly_priority_rows,
+        ))
     plain_lines.extend(plain_candidates("自选列表候选", watch_rows))
     plain_lines.append(f"加密列表：数据返回 {crypto.get('rows_count')}/{crypto.get('symbols_count')}；未返回/数据不足：{missing_text(crypto)}")
     plain_lines.extend(plain_candidates("加密列表均线密集", crypto_rows))
@@ -317,6 +381,9 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
           </section>
         """
 
+    priority_html_items = "".join(f"<li>{esc(item[3:])}</li>" for item in priority_lines)
+    weekly_priority_section = weekly_priority_html(weekly_priority_rows) if report_type == "weekly" else ""
+
     html_body = f"""<!doctype html>
 <html>
   <body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,'Microsoft YaHei',sans-serif;color:#111827;">
@@ -330,13 +397,11 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
       <div style="background:#ffffff;border-radius:10px;margin-top:12px;padding:14px 16px;border:1px solid #e5e7eb;">
         <div style="font-size:15px;font-weight:700;margin-bottom:8px;">筛选优先级</div>
         <ol style="margin:0;padding-left:20px;color:#374151;font-size:13px;line-height:1.65;">
-          <li>自选列表：均线密集需同时满足 ATR 压缩和六线跨度占比，且J值越小越加分。</li>
-          <li>回踩20日与60日均线并列第二，J值越小权重越高。</li>
-          <li>MACD背离仅作为辅助评分，不做硬筛选。</li>
-          <li>加密列表：目前只看均线密集；密集后J&lt;0作为加分项。</li>
+          {priority_html_items}
         </ol>
       </div>
 
+      {weekly_priority_section}
       {section_html("自选列表候选", watch, watch_rows)}
       {section_html("加密列表均线密集", crypto, crypto_rows)}
       {error_html}

@@ -38,6 +38,10 @@ YF_CACHE_DIR = ROOT.parent.parent.parent / "data" / "yfinance-cache"
 DENSE = "\u5747\u7ebf\u5bc6\u96c6"
 PULL20 = "\u56de\u8e2920"
 PULL60 = "\u56de\u8e2960"
+WEEKLY_J_LT_ZERO = "\u5468\u7ebfJ<0"
+
+KDJ_MAX_BONUS = 35
+WEEKLY_J_LT_ZERO_EXTRA_BONUS = 15
 
 YAHOO_OVERRIDES = {
     "NASDAQ:NDX": "^NDX",
@@ -123,7 +127,7 @@ class Candidate:
     source: str = "yfinance-local"
 
     def sort_tuple(self) -> tuple[int, int, float, float]:
-        kind_score = {DENSE: 0, PULL20: 1, PULL60: 1}.get(self.kind, 9)
+        kind_score = {WEEKLY_J_LT_ZERO: -1, DENSE: 0, PULL20: 1, PULL60: 1}.get(self.kind, 9)
         density = self.density if self.density is not None else 999.0
         j_value = self.j if self.j is not None else 999.0
         return (kind_score, -self.score, j_value, density)
@@ -149,7 +153,7 @@ def clamp_score(value: float) -> int:
     return max(0, min(100, round(value)))
 
 
-def kdj_j_bonus(j: float | None, max_bonus: int = 35, start: float = 20.0) -> int:
+def kdj_j_bonus(j: float | None, max_bonus: int = KDJ_MAX_BONUS, start: float = 20.0) -> int:
     if j is None or j >= start:
         return 0
     raw = ((start - j) / start) * max_bonus
@@ -362,7 +366,70 @@ def recent_macd_divergence(df: pd.DataFrame, pivot_left: int = 5, pivot_right: i
     return f"{note}@{age}bars", score
 
 
-def classify_frame(tv_symbol: str, yahoo: str, market: str, df: pd.DataFrame, th: Thresholds, crypto_dense_only: bool = False) -> list[Candidate]:
+def weekly_j_lt_zero_candidate(
+    tv_symbol: str,
+    yahoo: str,
+    market: str,
+    df: pd.DataFrame,
+) -> Candidate | None:
+    """Build the independent weekly J<0 candidate without requiring 120-week MAs."""
+    if len(df) < 2:
+        return None
+    row = df.iloc[-1]
+    prev = df.iloc[-2]
+    close = clean_float(row.get("close"))
+    j = clean_float(row.get("J"))
+    if close is None or j is None or j >= 0:
+        return None
+
+    prev_j = clean_float(prev.get("J"))
+    note, _ = kdj_note(j, prev_j)
+    prev_close = clean_float(prev.get("close"))
+    change = (close / prev_close - 1.0) * 100.0 if prev_close else None
+    atr = clean_float(row.get("ATR"))
+    ma_values = [clean_float(row.get(key)) for key in ["SMA20", "EMA20", "SMA60", "EMA60", "SMA120", "EMA120"]]
+    density = None
+    if atr is not None and atr > 0 and all(value is not None for value in ma_values):
+        valid_ma_values = [value for value in ma_values if value is not None]
+        density = (max(valid_ma_values) - min(valid_ma_values)) / atr
+
+    dif = clean_float(row.get("MACD_DIF"))
+    dea = clean_float(row.get("MACD_DEA"))
+    macd = None if dif is None or dea is None else ("DIF>=DEA" if dif >= dea else "DIF<DEA")
+    macd_div, _ = recent_macd_divergence(df)
+    total_kdj_weight = KDJ_MAX_BONUS + WEEKLY_J_LT_ZERO_EXTRA_BONUS
+    return Candidate(
+        symbol=tv_symbol,
+        yahoo=yahoo,
+        name=tv_symbol.split(":")[-1],
+        market=market,
+        close=close,
+        change=change,
+        density=density,
+        kind=WEEKLY_J_LT_ZERO,
+        reason=(
+            f"\u5468\u7ebfKDJ J\u503c{j:.1f}<0\uff0cKDJ\u9ad8\u6743\u91cd +{total_kdj_weight}\u5206\uff1b"
+            "\u8be5\u540d\u5355\u4e0d\u8981\u6c42\u540c\u65f6\u6ee1\u8db3\u5747\u7ebf\u5bc6\u96c6\u6216\u56de\u8e29\u6761\u4ef6"
+        ),
+        tags=["J<0"],
+        j=j,
+        prev_j=prev_j,
+        macd=macd,
+        macd_divergence=macd_div,
+        score=clamp_score(50 + total_kdj_weight),
+        kdj_note=note,
+    )
+
+
+def classify_frame(
+    tv_symbol: str,
+    yahoo: str,
+    market: str,
+    df: pd.DataFrame,
+    th: Thresholds,
+    crypto_dense_only: bool = False,
+    timeframe: str = "daily",
+) -> list[Candidate]:
     if len(df) < 130:
         return []
     row = df.iloc[-1]
@@ -419,9 +486,11 @@ def classify_frame(tv_symbol: str, yahoo: str, market: str, df: pd.DataFrame, th
         macd_divergence=macd_div,
     )
     candidates: list[Candidate] = []
+    weekly_j_extra_bonus = WEEKLY_J_LT_ZERO_EXTRA_BONUS if timeframe == "weekly" and j is not None and j < 0 else 0
+
     above_20_group = close > max(ma20, ema20)
     if above_20_group and density <= th.dense_atr and width_pct <= th.dense_width_pct and price_dist <= th.dense_price_atr:
-        kdj_bonus = kdj_j_bonus(j, 35)
+        kdj_bonus = kdj_j_bonus(j) + weekly_j_extra_bonus
         score = clamp_score(100 - (density / th.dense_atr) * 45 - (price_dist / th.dense_price_atr) * 30 + kdj_bonus + (5 if change and change > 0 else 0) + macd_div_score)
         candidates.append(Candidate(
             kind=DENSE,
@@ -459,7 +528,7 @@ def classify_frame(tv_symbol: str, yahoo: str, market: str, df: pd.DataFrame, th
         close_distance_atr = zone_distance(close, group_low, group_high) / atr
         low_distance_atr = zone_distance(low, group_low, group_high) / atr
         score = 44 + 15 + max(0, 10 - close_distance_atr * 12)
-        score += kdj_j_bonus(j, 35)
+        score += kdj_j_bonus(j) + weekly_j_extra_bonus
         if j_hook:
             score += 15
         if change and change > 0:
@@ -511,6 +580,8 @@ def scan(symbol_file: Path, timeframe: str, th: Thresholds, crypto_dense_only: b
     missing: list[str] = []
     errors: list[str] = []
     sections: dict[str, list[Candidate]] = {DENSE: [], PULL20: [], PULL60: []}
+    if timeframe == "weekly":
+        sections[WEEKLY_J_LT_ZERO] = []
     for market, tickers in symbols.items():
         for tv_symbol in tickers:
             yahoo = tv_to_yahoo(tv_symbol)
@@ -526,12 +597,26 @@ def scan(symbol_file: Path, timeframe: str, th: Thresholds, crypto_dense_only: b
                     continue
                 ind = add_indicators(df)
                 rows_count += 1
-                for cand in classify_frame(tv_symbol, yahoo, market, ind, th, crypto_dense_only=crypto_dense_only):
+                if timeframe == "weekly":
+                    weekly_candidate = weekly_j_lt_zero_candidate(tv_symbol, yahoo, market, ind)
+                    if weekly_candidate is not None:
+                        sections[WEEKLY_J_LT_ZERO].append(weekly_candidate)
+                for cand in classify_frame(
+                    tv_symbol,
+                    yahoo,
+                    market,
+                    ind,
+                    th,
+                    crypto_dense_only=crypto_dense_only,
+                    timeframe=timeframe,
+                ):
                     sections.setdefault(cand.kind, []).append(cand)
             except Exception as exc:
                 missing.append(tv_symbol)
                 errors.append(f"{tv_symbol}->{yahoo}: {type(exc).__name__}: {exc}")
     allowed_sections = [DENSE] if crypto_dense_only else [DENSE, PULL20, PULL60]
+    if timeframe == "weekly":
+        allowed_sections.insert(0, WEEKLY_J_LT_ZERO)
     for key in list(sections):
         if key not in allowed_sections:
             sections[key] = []
@@ -592,6 +677,14 @@ def self_test() -> None:
     assert not pd.isna(ind["SMA120"].iloc[-1])
     assert not pd.isna(ind["J"].iloc[-1])
     assert not pd.isna(ind["MACD_DIF"].iloc[-1])
+    weekly_test = ind.copy()
+    weekly_test.loc[weekly_test.index[-2], "J"] = -8.0
+    weekly_test.loc[weekly_test.index[-1], "J"] = -5.0
+    weekly_candidate = weekly_j_lt_zero_candidate("NASDAQ:TEST", "TEST", "america", weekly_test)
+    assert weekly_candidate is not None and weekly_candidate.kind == WEEKLY_J_LT_ZERO
+    assert weekly_candidate.score == 100
+    assert kdj_j_bonus(-1.0) == KDJ_MAX_BONUS
+    assert KDJ_MAX_BONUS + WEEKLY_J_LT_ZERO_EXTRA_BONUS == 50
     print("self-test passed")
 
 
