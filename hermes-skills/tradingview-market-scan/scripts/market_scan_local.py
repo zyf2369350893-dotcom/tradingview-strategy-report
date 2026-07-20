@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Full OHLCV local recalculation scanner for the TradingView watch universe.
 
-Data source: yfinance OHLCV. Indicators are recalculated locally to match the
-user's Pine formulas more closely than TradingView scanner indicator fields.
+Data source: yfinance OHLCV for moving averages, ATR and MACD. TradingView K/D
+snapshots are authoritative for J-based scoring, so chart and email triggers use
+the same data source.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import math
 import os
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import contextlib
@@ -34,6 +36,15 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_SYMBOLS = ROOT / "symbols.json"
 DEFAULT_STATE_DIR = Path(os.environ.get("TV_SCAN_STATE_DIR", ROOT.parent.parent.parent / "automation" / "state"))
 YF_CACHE_DIR = ROOT.parent.parent.parent / "data" / "yfinance-cache"
+TRADINGVIEW_MARKET_ENDPOINTS = {
+    "america": "https://scanner.tradingview.com/america/scan",
+    "china": "https://scanner.tradingview.com/china/scan",
+    "hongkong": "https://scanner.tradingview.com/hongkong/scan",
+    "korea": "https://scanner.tradingview.com/korea/scan",
+    "crypto": "https://scanner.tradingview.com/crypto/scan",
+    "futures": "https://scanner.tradingview.com/futures/scan",
+    "cfd": "https://scanner.tradingview.com/cfd/scan",
+}
 
 DENSE = "\u5747\u7ebf\u5bc6\u96c6"
 PULL20 = "\u56de\u8e2920"
@@ -147,6 +158,109 @@ def clean_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return None if math.isnan(result) or math.isinf(result) else result
+
+
+def chunked(items: list[str], size: int) -> list[list[str]]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def post_json(url: str, payload: dict[str, Any], timeout: int = 20) -> dict[str, Any]:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 strategy-report/1.0",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def tradingview_kdj_columns(timeframe: str) -> list[str]:
+    base = ["Stoch.K", "Stoch.D", "Stoch.K[1]", "Stoch.D[1]"]
+    if timeframe == "daily":
+        return base
+    return [f"{column}|1W" for column in base]
+
+
+def kdj_from_stoch_values(
+    k: Any,
+    d: Any,
+    prev_k: Any = None,
+    prev_d: Any = None,
+) -> tuple[float, float | None] | None:
+    k_value = clean_float(k)
+    d_value = clean_float(d)
+    if k_value is None or d_value is None:
+        return None
+    prev_k_value = clean_float(prev_k)
+    prev_d_value = clean_float(prev_d)
+    j = 3 * k_value - 2 * d_value
+    prev_j = None
+    if prev_k_value is not None and prev_d_value is not None:
+        prev_j = 3 * prev_k_value - 2 * prev_d_value
+    return j, prev_j
+
+
+def fetch_tradingview_kdj(
+    market: str,
+    tickers: list[str],
+    timeframe: str,
+) -> tuple[dict[str, tuple[float, float | None]], list[str]]:
+    """Fetch TradingView's K/D snapshot and derive the J value shown there."""
+    endpoint = TRADINGVIEW_MARKET_ENDPOINTS.get(market)
+    if endpoint is None:
+        return {}, [f"TradingView KDJ endpoint unavailable for market: {market}"]
+    columns = tradingview_kdj_columns(timeframe)
+    values_by_symbol: dict[str, tuple[float, float | None]] = {}
+    errors: list[str] = []
+    for part in chunked(tickers, 80):
+        payload = {
+            "symbols": {"tickers": part, "query": {"types": []}},
+            "columns": columns,
+            "sort": {"sortBy": "name", "sortOrder": "asc"},
+            "options": {"lang": "zh"},
+            "range": [0, len(part)],
+        }
+        try:
+            response = post_json(endpoint, payload)
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+            errors.append(f"TradingView KDJ {market}: {type(exc).__name__}: {exc}")
+            continue
+        for item in response.get("data", []):
+            row = dict(zip(columns, item.get("d", [])))
+            values = kdj_from_stoch_values(*(row.get(column) for column in columns))
+            symbol = str(item.get("s") or "")
+            if symbol and values is not None:
+                values_by_symbol[symbol] = values
+    return values_by_symbol, errors
+
+
+def apply_tradingview_kdj(
+    df: pd.DataFrame,
+    values: tuple[float, float | None] | None,
+    *,
+    required: bool = False,
+) -> pd.DataFrame:
+    """Replace local J with TradingView J; clear it when verification is required."""
+    out = df.copy()
+    if "J" not in out.columns or out.empty:
+        return out
+    if values is None:
+        if required:
+            out.loc[out.index[-1], "J"] = math.nan
+            if len(out) >= 2:
+                out.loc[out.index[-2], "J"] = math.nan
+        return out
+    j, prev_j = values
+    out.loc[out.index[-1], "J"] = j
+    if len(out) >= 2:
+        out.loc[out.index[-2], "J"] = math.nan if prev_j is None else prev_j
+    return out
 
 
 def clamp_score(value: float) -> int:
@@ -371,6 +485,7 @@ def weekly_j_lt_zero_candidate(
     yahoo: str,
     market: str,
     df: pd.DataFrame,
+    source: str = "yfinance-local",
 ) -> Candidate | None:
     """Build the independent weekly J<0 candidate without requiring 120-week MAs."""
     if len(df) < 2:
@@ -418,6 +533,7 @@ def weekly_j_lt_zero_candidate(
         macd_divergence=macd_div,
         score=clamp_score(50 + total_kdj_weight),
         kdj_note=note,
+        source=source,
     )
 
 
@@ -429,6 +545,7 @@ def classify_frame(
     th: Thresholds,
     crypto_dense_only: bool = False,
     timeframe: str = "daily",
+    kdj_source: str = "yfinance-local",
 ) -> list[Candidate]:
     if len(df) < 130:
         return []
@@ -484,6 +601,7 @@ def classify_frame(
         prev_j=prev_j,
         macd=macd,
         macd_divergence=macd_div,
+        source=kdj_source,
     )
     candidates: list[Candidate] = []
     weekly_j_extra_bonus = WEEKLY_J_LT_ZERO_EXTRA_BONUS if timeframe == "weekly" and j is not None and j < 0 else 0
@@ -583,6 +701,8 @@ def scan(symbol_file: Path, timeframe: str, th: Thresholds, crypto_dense_only: b
     if timeframe == "weekly":
         sections[WEEKLY_J_LT_ZERO] = []
     for market, tickers in symbols.items():
+        tradingview_kdj, tradingview_errors = fetch_tradingview_kdj(market, tickers, timeframe)
+        errors.extend(tradingview_errors)
         for tv_symbol in tickers:
             yahoo = tv_to_yahoo(tv_symbol)
             if not yahoo:
@@ -596,9 +716,16 @@ def scan(symbol_file: Path, timeframe: str, th: Thresholds, crypto_dense_only: b
                     errors.append(f"empty ohlcv: {tv_symbol}->{yahoo}")
                     continue
                 ind = add_indicators(df)
+                verified_kdj = tradingview_kdj.get(tv_symbol)
+                ind = apply_tradingview_kdj(ind, verified_kdj, required=timeframe == "weekly")
+                kdj_source = "yfinance-local+tradingview-kdj" if verified_kdj is not None else "yfinance-local"
+                if timeframe == "weekly" and verified_kdj is None:
+                    errors.append(
+                        f"TradingView KDJ unavailable: {tv_symbol}; weekly KDJ weight skipped"
+                    )
                 rows_count += 1
                 if timeframe == "weekly":
-                    weekly_candidate = weekly_j_lt_zero_candidate(tv_symbol, yahoo, market, ind)
+                    weekly_candidate = weekly_j_lt_zero_candidate(tv_symbol, yahoo, market, ind, source=kdj_source)
                     if weekly_candidate is not None:
                         sections[WEEKLY_J_LT_ZERO].append(weekly_candidate)
                 for cand in classify_frame(
@@ -609,6 +736,7 @@ def scan(symbol_file: Path, timeframe: str, th: Thresholds, crypto_dense_only: b
                     th,
                     crypto_dense_only=crypto_dense_only,
                     timeframe=timeframe,
+                    kdj_source=kdj_source,
                 ):
                     sections.setdefault(cand.kind, []).append(cand)
             except Exception as exc:
@@ -624,7 +752,7 @@ def scan(symbol_file: Path, timeframe: str, th: Thresholds, crypto_dense_only: b
             sections[key] = sorted(sections[key], key=lambda c: c.sort_tuple())[:th.max_items_per_section]
     return {
         "timeframe": timeframe,
-        "source": "yfinance-local-recalc",
+        "source": "yfinance-local-recalc+tradingview-kdj",
         "generated_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds"),
         "symbols_count": len(requested),
         "rows_count": rows_count,
@@ -678,11 +806,17 @@ def self_test() -> None:
     assert not pd.isna(ind["J"].iloc[-1])
     assert not pd.isna(ind["MACD_DIF"].iloc[-1])
     weekly_test = ind.copy()
-    weekly_test.loc[weekly_test.index[-2], "J"] = -8.0
-    weekly_test.loc[weekly_test.index[-1], "J"] = -5.0
-    weekly_candidate = weekly_j_lt_zero_candidate("NASDAQ:TEST", "TEST", "america", weekly_test)
+    weekly_test.loc[weekly_test.index[-2], "J"] = -16.2
+    weekly_test.loc[weekly_test.index[-1], "J"] = -22.5
+    tradingview_positive = apply_tradingview_kdj(weekly_test, (24.1, 30.0), required=True)
+    assert weekly_j_lt_zero_candidate("SSE:561980", "561980.SS", "china", tradingview_positive) is None
+    tradingview_missing = apply_tradingview_kdj(weekly_test, None, required=True)
+    assert weekly_j_lt_zero_candidate("SSE:561980", "561980.SS", "china", tradingview_missing) is None
+    tradingview_negative = apply_tradingview_kdj(weekly_test, (-5.0, -8.0), required=True)
+    weekly_candidate = weekly_j_lt_zero_candidate("NASDAQ:TEST", "TEST", "america", tradingview_negative)
     assert weekly_candidate is not None and weekly_candidate.kind == WEEKLY_J_LT_ZERO
     assert weekly_candidate.score == 100
+    assert kdj_from_stoch_values(57.2946126279, 73.8948034240) is not None
     assert kdj_j_bonus(-1.0) == KDJ_MAX_BONUS
     assert KDJ_MAX_BONUS + WEEKLY_J_LT_ZERO_EXTRA_BONUS == 50
     print("self-test passed")

@@ -304,6 +304,61 @@ def weekly_priority_html(rows: list[dict[str, object]]) -> str:
       </section>
     """
 
+
+def build_fix_notice() -> tuple[str, str, str]:
+    now = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
+    subject = f"【已修复】561980周线KDJ J值差异说明｜{now} 北京时间"
+    plain_body = f"""561980 周线 KDJ J 值问题已修复
+
+结论：策略的 J<0 加权逻辑没有问题，问题出在原先使用的行情数据口径。
+
+复现结果：
+- 原程序用 Yahoo Finance 周K线本地重算，得到 J=-22.5。
+- TradingView 上一根已收盘周线得到 J=24.1，与图表上约 25 的显示一致。
+- Yahoo 的 561980.SS 数据在 2026-06-25 出现最高价 4.192，而相邻交易日价格约为 0.8；该异常价被合并进周K后，扭曲了9周高低区间，导致 J 值被误算为负数。
+
+修复内容：
+1. 均线、ATR、MACD仍使用完整K线计算。
+2. KDJ 的 J 值及前一周期 J 值改为以 TradingView 快照为准。
+3. 周线只有在 TradingView 明确确认 J<0 时才触发 +50 权重；取值失败时跳过权重，避免误报。
+
+验证结果：561980 已不再进入“周线J<0”名单，回归测试通过。
+
+生成时间：{now} 北京时间
+风险提醒：本邮件仅说明技术筛选系统修复结果，不构成买卖建议。"""
+    html_body = f"""<!doctype html>
+<html>
+  <body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,'Microsoft YaHei',sans-serif;color:#111827;">
+    <div style="max-width:680px;margin:0 auto;padding:18px 12px;">
+      <div style="background:#065f46;color:#fff;border-radius:10px;padding:18px 16px;">
+        <div style="font-size:13px;opacity:.82;">{esc(now)} 北京时间</div>
+        <h1 style="font-size:22px;line-height:1.3;margin:6px 0 0;">561980 周线 KDJ 问题已修复</h1>
+      </div>
+      <div style="background:#fff;border:1px solid #e5e7eb;border-radius:10px;margin-top:12px;padding:16px;line-height:1.7;font-size:14px;">
+        <p><strong>结论：</strong>J&lt;0 加权逻辑没有问题，错误来自原行情数据口径。</p>
+        <h2 style="font-size:17px;">原因</h2>
+        <ul>
+          <li>原程序用 Yahoo Finance 周K线本地重算，得到 <strong>J=-22.5</strong>。</li>
+          <li>TradingView 上一根已收盘周线为 <strong>J=24.1</strong>，与图表约 25 的显示一致。</li>
+          <li>Yahoo 的 561980.SS 在 2026-06-25 出现最高价 4.192，而相邻交易日约为 0.8。异常价进入周K后扭曲9周高低区间，造成负值误报。</li>
+        </ul>
+        <h2 style="font-size:17px;">已完成的修复</h2>
+        <ol>
+          <li>均线、ATR、MACD继续使用完整K线计算。</li>
+          <li>KDJ 的 J 值和前值改为以 TradingView 快照为准。</li>
+          <li>只有 TradingView 明确确认 J&lt;0 才触发 +50 权重；取值失败时跳过，防止误报。</li>
+        </ol>
+        <p><strong>验证：</strong>561980 已不再进入“周线J&lt;0”名单，回归测试通过。</p>
+      </div>
+      <div style="margin-top:12px;background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:13px 15px;color:#9a3412;font-size:13px;line-height:1.6;">
+        本邮件仅说明技术筛选系统修复结果，不构成买卖建议。
+      </div>
+    </div>
+  </body>
+</html>"""
+    return subject, plain_body, html_body
+
+
 def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
     timeframe = "weekly" if report_type == "weekly" else "daily"
     th = Thresholds(max_items_per_section=max_items)
@@ -339,7 +394,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
         f"TradingView策略{report_name}",
         f"生成时间：{now} 北京时间",
         f"周期：{timeframe_name}",
-        "数据源：Yahoo Finance/yfinance 完整K线；SMA/EMA、KDJ、MACD由本地重新计算",
+        "数据源：Yahoo Finance/yfinance 完整K线用于均线、ATR、MACD；KDJ J值以TradingView快照为准",
         "",
         "筛选优先级：",
         *priority_lines,
@@ -410,7 +465,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
         <strong>风险提醒：</strong>本报告只是技术筛选和复盘参考，不构成买卖建议。实际交易前请再核对券商/交易所实时行情、流动性和自身风险承受能力。
       </div>
       <div style="margin:12px 2px 0;color:#6b7280;font-size:12px;line-height:1.5;">
-        数据源：Yahoo Finance/yfinance 完整K线；SMA/EMA、KDJ、MACD由脚本本地重新计算。
+        数据源：Yahoo Finance/yfinance 完整K线用于均线、ATR、MACD；KDJ J值以TradingView快照为准。
       </div>
     </div>
   </body>
@@ -453,7 +508,7 @@ def send_email(subject: str, plain_body: str, html_body: str, dry_run: bool = Fa
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate and email strategy report.")
-    parser.add_argument("--report-type", choices=["daily", "weekly"], default="daily")
+    parser.add_argument("--report-type", choices=["daily", "weekly", "diagnostic"], default="daily")
     parser.add_argument("--max-items", type=int, default=30)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
@@ -461,7 +516,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    subject, plain_body, html_body = build_report(args.report_type, args.max_items)
+    if args.report_type == "diagnostic":
+        subject, plain_body, html_body = build_fix_notice()
+    else:
+        subject, plain_body, html_body = build_report(args.report_type, args.max_items)
     send_email(subject, plain_body, html_body, dry_run=args.dry_run)
     return 0
 

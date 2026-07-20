@@ -21,6 +21,7 @@ on:
         options:
           - daily
           - weekly
+          - diagnostic
       dry_run:
         description: 'Print report without sending email'
         required: true
