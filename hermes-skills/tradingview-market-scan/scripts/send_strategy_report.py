@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 from market_scan_local import (
     DENSE,
+    KDJ_FALLBACK_MAX_BONUS,
     KDJ_MAX_BONUS,
     MACD_MAX_SCORE,
     PULL20,
@@ -141,6 +142,27 @@ def fmt_macd_score(value: object) -> str:
     except (TypeError, ValueError):
         return "0分"
 
+
+def zh_kdj_source(source: object) -> str:
+    text = str(source or "").strip()
+    if text.startswith("tradingview-kdj-fallback:"):
+        return f"TradingView备用同标的（{text.split(':', 1)[1]}）"
+    if text.startswith("tradingview-kdj:"):
+        return f"TradingView正式KDJ（{text.split(':', 1)[1]}）"
+    if text == "yfinance-local-kdj-fallback":
+        return "Yahoo本地KDJ（备用）"
+    if "tradingview-kdj" in text:
+        return "TradingView正式KDJ"
+    return text or "-"
+
+
+def fmt_kdj_weight_cap(value: object) -> str:
+    try:
+        return f"+{int(value)}分"
+    except (TypeError, ValueError):
+        return "-"
+
+
 def zh_reason(reason: object) -> str:
     text = str(reason or "").strip()
     if not text:
@@ -196,12 +218,14 @@ def weekly_j_lt_zero_rows(
         if symbol and symbol not in unique:
             unique[symbol] = row
 
-    def sort_key(row: dict[str, object]) -> tuple[float, str]:
+    def sort_key(row: dict[str, object]) -> tuple[int, float, str]:
+        source = str(row.get("source") or "")
+        fallback_rank = 1 if "fallback" in source else 0
         try:
             j_value = float(row.get("j"))
         except (TypeError, ValueError):
             j_value = float("inf")
-        return (j_value, str(row.get("symbol") or ""))
+        return (fallback_rank, j_value, str(row.get("symbol") or ""))
 
     return sorted(unique.values(), key=sort_key)[:max_items]
 
@@ -222,6 +246,7 @@ def plain_candidates(title: str, rows: list[dict[str, object]]) -> list[str]:
             f"{idx}. {row.get('symbol')}｜{zh_kind(row.get('kind'))}｜评分 {row.get('score')}",
             f"收盘 {fmt_float(row.get('close'))}｜涨跌 {fmt_pct(row.get('change'))}｜J {fmt_float(row.get('j'), 1)}",
             f"KDJ：{zh_kdj_note(row.get('kdj_note'))}",
+            f"KDJ数据：{zh_kdj_source(row.get('source'))}；权重上限 {fmt_kdj_weight_cap(row.get('kdj_weight_cap'))}",
             f"MACD：{zh_macd(row.get('macd'))}；{zh_divergence(row.get('macd_divergence'))}；计分 {fmt_macd_score(row.get('macd_divergence_score'))}",
             f"原因：{zh_reason(row.get('reason'))}",
         ]
@@ -239,6 +264,8 @@ def card_html(row: dict[str, object], idx: int) -> str:
     change = esc(fmt_pct(row.get("change")))
     j_value = esc(fmt_float(row.get("j"), 1))
     kdj = esc(zh_kdj_note(row.get("kdj_note")))
+    kdj_source = esc(zh_kdj_source(row.get("source")))
+    kdj_weight_cap = esc(fmt_kdj_weight_cap(row.get("kdj_weight_cap")))
     macd = esc(zh_macd(row.get("macd")))
     div = esc(zh_divergence(row.get("macd_divergence")))
     macd_score = esc(fmt_macd_score(row.get("macd_divergence_score")))
@@ -272,6 +299,10 @@ def card_html(row: dict[str, object], idx: int) -> str:
           <tr>
             <td style="padding:5px 0;color:#6b7280;">J值</td>
             <td style="padding:5px 0;text-align:right;font-weight:700;color:#111827;">{j_value}</td>
+          </tr>
+          <tr>
+            <td style="padding:5px 0;color:#6b7280;">KDJ数据</td>
+            <td style="padding:5px 0;text-align:right;color:#111827;">{kdj_source}；权重上限 {kdj_weight_cap}</td>
           </tr>
           <tr>
             <td style="padding:5px 0;color:#6b7280;">MACD辅助</td>
@@ -310,9 +341,9 @@ def weekly_priority_html(rows: list[dict[str, object]]) -> str:
     total_weight = KDJ_MAX_BONUS + WEEKLY_J_LT_ZERO_EXTRA_BONUS
     return f"""
       <section style="margin-top:22px;background:#fffbeb;border:2px solid #f59e0b;border-radius:10px;padding:14px;">
-        <h2 style="font-size:18px;margin:0 0 8px;color:#92400e;">周线 KDJ J&lt;0 高权重关注</h2>
+        <h2 style="font-size:18px;margin:0 0 8px;color:#92400e;">周线 KDJ J&lt;0 关注（正式优先）</h2>
         <div style="font-size:13px;color:#92400e;line-height:1.55;margin-bottom:10px;">
-          独立筛选全股票池，KDJ总权重 +{total_weight} 分，按J值从低到高排列；可能与下方常规候选重复。
+          TradingView正式KDJ最高 +{total_weight} 分；备用KDJ最高 +{KDJ_FALLBACK_MAX_BONUS} 分。正式数据优先，再按J值从低到高排列；可能与下方常规候选重复。
         </div>
         {cards_html(rows)}
       </section>
@@ -390,7 +421,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
 
     if report_type == "weekly":
         priority_lines = [
-            f"1. 周线J<0：独立筛选全股票池，KDJ总权重 +{total_weekly_kdj_weight} 分，并在邮件置顶单列。",
+            f"1. 周线J<0：TradingView正式KDJ最高 +{total_weekly_kdj_weight} 分；无数据时自动备用且最高 +{KDJ_FALLBACK_MAX_BONUS} 分，正式数据优先置顶。",
             "2. 自选列表：均线密集需同时满足 ATR 压缩和六线跨度占比，且J值越小越加分。",
             "3. 回踩20周与60周均线并列，J值越小权重越高。",
             f"4. MACD约占15%辅助权重，最高±{MACD_MAX_SCORE}分：DIF识别±4、柱体共振再±3、正式确认再±5；1周内全分，2至3周半分，超过3周只显示不计分。",
@@ -408,7 +439,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
         f"TradingView策略{report_name}",
         f"生成时间：{now} 北京时间",
         f"周期：{timeframe_name}",
-        "数据源：Yahoo Finance/yfinance 完整K线用于均线、ATR、MACD；KDJ J值以TradingView快照为准",
+        "数据源：Yahoo Finance/yfinance 完整K线用于均线、ATR、MACD；KDJ优先TradingView，缺失时自动启用低权重备用",
         "",
         "筛选优先级：",
         *priority_lines,
@@ -417,7 +448,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
     ]
     if report_type == "weekly":
         plain_lines.extend(plain_candidates(
-            f"周线 KDJ J<0 高权重关注（KDJ总权重 +{total_weekly_kdj_weight}，按J值从低到高）",
+            f"周线 KDJ J<0 关注（正式最高 +{total_weekly_kdj_weight}，备用最高 +{KDJ_FALLBACK_MAX_BONUS}，正式优先）",
             weekly_priority_rows,
         ))
     plain_lines.extend(plain_candidates("自选列表候选", watch_rows))
@@ -479,7 +510,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
         <strong>风险提醒：</strong>本报告只是技术筛选和复盘参考，不构成买卖建议。实际交易前请再核对券商/交易所实时行情、流动性和自身风险承受能力。
       </div>
       <div style="margin:12px 2px 0;color:#6b7280;font-size:12px;line-height:1.5;">
-        数据源：Yahoo Finance/yfinance 完整K线用于均线、ATR、MACD；KDJ J值以TradingView快照为准。
+        数据源：Yahoo Finance/yfinance 完整K线用于均线、ATR、MACD；KDJ优先TradingView，缺失时自动启用最高 +15 分的低权重备用。
       </div>
     </div>
   </body>
