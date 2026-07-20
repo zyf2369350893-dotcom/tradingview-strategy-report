@@ -54,6 +54,18 @@ WEEKLY_J_LT_ZERO = "\u5468\u7ebfJ<0"
 KDJ_MAX_BONUS = 35
 WEEKLY_J_LT_ZERO_EXTRA_BONUS = 15
 
+# MACD remains an auxiliary score: identification +/-4, histogram resonance
+# another +/-3, and formal confirmation another +/-5 (maximum +/-12).
+MACD_IDENTIFICATION_SCORE = 4
+MACD_RESONANCE_SCORE = 3
+MACD_CONFIRMATION_SCORE = 5
+MACD_MAX_SCORE = MACD_IDENTIFICATION_SCORE + MACD_RESONANCE_SCORE + MACD_CONFIRMATION_SCORE
+MACD_PIVOT_LEFT = 5
+MACD_PIVOT_RIGHT = 2
+MACD_MIN_BARS = 5
+MACD_MAX_BARS = 80
+MACD_CONFIRMATION_WINDOW = 12
+
 YAHOO_OVERRIDES = {
     "NASDAQ:NDX": "^NDX",
     "BOATS:DRAM": "DRAM",
@@ -132,6 +144,7 @@ class Candidate:
     prev_j: float | None = None
     macd: str | None = None
     macd_divergence: str = ""
+    macd_divergence_score: int = 0
     score: int = 0
     kdj_note: str = ""
     fresh_pullback: bool = False
@@ -423,62 +436,184 @@ def kdj_note(j: float | None, prev_j: float | None) -> tuple[str, bool]:
     return f"J{prev_j:.1f}->{j:.1f}", False
 
 
-def recent_macd_divergence(df: pd.DataFrame, pivot_left: int = 5, pivot_right: int = 5, min_bars: int = 5, max_bars: int = 80, recent_confirm_bars: int = 15) -> tuple[str, int]:
+def _macd_freshness_score(raw_score: int, age: int, timeframe: str) -> int:
+    """Apply the agreed daily/weekly signal-age decay to the MACD score."""
+    full_bars, half_bars = (1, 3) if timeframe == "weekly" else (3, 7)
+    if age <= full_bars:
+        return raw_score
+    if age <= half_bars:
+        return round(raw_score * 0.5)
+    return 0
+
+
+def recent_macd_divergence(
+    df: pd.DataFrame,
+    timeframe: str = "daily",
+    pivot_left: int = MACD_PIVOT_LEFT,
+    pivot_right: int = MACD_PIVOT_RIGHT,
+    min_bars: int = MACD_MIN_BARS,
+    max_bars: int = MACD_MAX_BARS,
+    confirmation_window: int = MACD_CONFIRMATION_WINDOW,
+) -> tuple[str, int]:
+    """Return the latest standard DIF divergence stage and its decayed score.
+
+    DIF pivots are the only divergence anchors. Histogram divergence merely
+    upgrades signal strength. A MACD cross or a price-structure break within
+    the confirmation window upgrades an identified signal to confirmed.
+    Hidden divergence is intentionally excluded from scoring.
+    """
     n = len(df)
+    required = {"high", "low", "close", "MACD_DIF", "MACD_DEA", "MACD_HIST"}
+    if n < pivot_left + pivot_right + 2 or not required.issubset(df.columns):
+        return "", 0
+
     high_pivots: list[int] = []
     low_pivots: list[int] = []
-    events: list[tuple[int, str, int]] = []
+    recognitions: dict[int, list[dict[str, Any]]] = {}
+    events: list[dict[str, Any]] = []
+
     for pivot in range(pivot_left, n - pivot_right):
         left = pivot - pivot_left
         right = pivot + pivot_right + 1
-        high = df["high"].iloc[pivot]
-        low = df["low"].iloc[pivot]
-        if pd.isna(high) or pd.isna(low):
+        dif = clean_float(df["MACD_DIF"].iloc[pivot])
+        if dif is None:
             continue
-        is_high = high >= df["high"].iloc[left:right].max()
-        is_low = low <= df["low"].iloc[left:right].min()
-        confirm = pivot + pivot_right
+        dif_window = pd.to_numeric(df["MACD_DIF"].iloc[left:right], errors="coerce")
+        if dif_window.isna().all():
+            continue
+        is_high = dif >= dif_window.max()
+        is_low = dif <= dif_window.min()
+        recognition = pivot + pivot_right
+
         if is_high:
             if high_pivots:
                 prev = high_pivots[-1]
                 distance = pivot - prev
-                if min_bars <= distance <= max_bars:
-                    curr_price = df["high"].iloc[pivot]
-                    prev_price = df["high"].iloc[prev]
-                    curr_dif = df["MACD_DIF"].iloc[pivot]
-                    prev_dif = df["MACD_DIF"].iloc[prev]
-                    curr_hist = df["MACD_HIST"].iloc[pivot]
-                    prev_hist = df["MACD_HIST"].iloc[prev]
-                    if curr_price > prev_price and (curr_dif < prev_dif or curr_hist < prev_hist):
-                        events.append((confirm, "MACD_BEAR_DIV", -8))
-                    elif curr_price < prev_price and (curr_dif > prev_dif or curr_hist > prev_hist):
-                        events.append((confirm, "MACD_HIDDEN_BEAR_DIV", -5))
+                curr_price = clean_float(df["high"].iloc[pivot])
+                prev_price = clean_float(df["high"].iloc[prev])
+                prev_dif = clean_float(df["MACD_DIF"].iloc[prev])
+                curr_hist = clean_float(df["MACD_HIST"].iloc[pivot])
+                prev_hist = clean_float(df["MACD_HIST"].iloc[prev])
+                if (
+                    min_bars <= distance <= max_bars
+                    and None not in (curr_price, prev_price, prev_dif, curr_hist, prev_hist)
+                    and curr_price > prev_price
+                    and dif < prev_dif
+                ):
+                    hist_left = clean_float(df["MACD_HIST"].iloc[pivot - 1])
+                    hist_right = clean_float(df["MACD_HIST"].iloc[pivot + 1])
+                    strong = (
+                        hist_left is not None
+                        and hist_right is not None
+                        and curr_hist < prev_hist
+                        and curr_hist >= hist_left
+                        and curr_hist >= hist_right
+                    )
+                    event = {
+                        "side": "BEAR",
+                        "strong": strong,
+                        "recognition": recognition,
+                        "break_level": clean_float(df["low"].iloc[pivot:recognition + 1].min()),
+                        "confirmed": None,
+                    }
+                    recognitions.setdefault(recognition, []).append(event)
+                    events.append(event)
             high_pivots.append(pivot)
+
         if is_low:
             if low_pivots:
                 prev = low_pivots[-1]
                 distance = pivot - prev
-                if min_bars <= distance <= max_bars:
-                    curr_price = df["low"].iloc[pivot]
-                    prev_price = df["low"].iloc[prev]
-                    curr_dif = df["MACD_DIF"].iloc[pivot]
-                    prev_dif = df["MACD_DIF"].iloc[prev]
-                    curr_hist = df["MACD_HIST"].iloc[pivot]
-                    prev_hist = df["MACD_HIST"].iloc[prev]
-                    if curr_price < prev_price and (curr_dif > prev_dif or curr_hist > prev_hist):
-                        events.append((confirm, "MACD_BULL_DIV", 12))
-                    elif curr_price > prev_price and (curr_dif < prev_dif or curr_hist < prev_hist):
-                        events.append((confirm, "MACD_HIDDEN_BULL_DIV", 6))
+                curr_price = clean_float(df["low"].iloc[pivot])
+                prev_price = clean_float(df["low"].iloc[prev])
+                prev_dif = clean_float(df["MACD_DIF"].iloc[prev])
+                curr_hist = clean_float(df["MACD_HIST"].iloc[pivot])
+                prev_hist = clean_float(df["MACD_HIST"].iloc[prev])
+                if (
+                    min_bars <= distance <= max_bars
+                    and None not in (curr_price, prev_price, prev_dif, curr_hist, prev_hist)
+                    and curr_price < prev_price
+                    and dif > prev_dif
+                ):
+                    hist_left = clean_float(df["MACD_HIST"].iloc[pivot - 1])
+                    hist_right = clean_float(df["MACD_HIST"].iloc[pivot + 1])
+                    strong = (
+                        hist_left is not None
+                        and hist_right is not None
+                        and curr_hist > prev_hist
+                        and curr_hist <= hist_left
+                        and curr_hist <= hist_right
+                    )
+                    event = {
+                        "side": "BULL",
+                        "strong": strong,
+                        "recognition": recognition,
+                        "break_level": clean_float(df["high"].iloc[pivot:recognition + 1].max()),
+                        "confirmed": None,
+                    }
+                    recognitions.setdefault(recognition, []).append(event)
+                    events.append(event)
             low_pivots.append(pivot)
+
+    pending: dict[str, dict[str, Any] | None] = {"BULL": None, "BEAR": None}
+    for idx in range(1, n):
+        for event in recognitions.get(idx, []):
+            pending[str(event["side"])] = event
+
+        dif = clean_float(df["MACD_DIF"].iloc[idx])
+        dea = clean_float(df["MACD_DEA"].iloc[idx])
+        prev_dif = clean_float(df["MACD_DIF"].iloc[idx - 1])
+        prev_dea = clean_float(df["MACD_DEA"].iloc[idx - 1])
+        close = clean_float(df["close"].iloc[idx])
+        bull_cross = None not in (dif, dea, prev_dif, prev_dea) and dif > dea and prev_dif <= prev_dea
+        bear_cross = None not in (dif, dea, prev_dif, prev_dea) and dif < dea and prev_dif >= prev_dea
+
+        for side, crossed in (("BULL", bull_cross), ("BEAR", bear_cross)):
+            event = pending[side]
+            if event is None:
+                continue
+            elapsed = idx - int(event["recognition"])
+            if elapsed > confirmation_window:
+                pending[side] = None
+                continue
+            break_level = clean_float(event.get("break_level"))
+            structure_break = (
+                close is not None
+                and break_level is not None
+                and (close > break_level if side == "BULL" else close < break_level)
+            )
+            if crossed or structure_break:
+                event["confirmed"] = idx
+                pending[side] = None
+
     if not events:
         return "", 0
-    recent = [(idx, note, score) for idx, note, score in events if n - 1 - idx <= recent_confirm_bars]
-    if not recent:
-        return "", 0
-    idx, note, score = recent[-1]
-    age = n - 1 - idx
-    return f"{note}@{age}bars", score
 
+    display_bars = 8 if timeframe == "weekly" else 15
+    recent_events: list[tuple[int, dict[str, Any]]] = []
+    for event in events:
+        signal_idx = int(event["confirmed"] if event["confirmed"] is not None else event["recognition"])
+        if n - 1 - signal_idx <= display_bars:
+            recent_events.append((signal_idx, event))
+    if not recent_events:
+        return "", 0
+
+    signal_idx, event = max(recent_events, key=lambda item: item[0])
+    age = n - 1 - signal_idx
+    side = str(event["side"])
+    strong = bool(event["strong"])
+    confirmed = event["confirmed"] is not None
+    expired = not confirmed and n - 1 - int(event["recognition"]) > confirmation_window
+    stage = "CONFIRMED" if confirmed else ("EXPIRED" if expired else "IDENTIFIED")
+    strength = "STRONG_" if strong else ""
+    note = f"MACD_DIF_{strength}{side}_{stage}@{age}bars"
+    magnitude = MACD_IDENTIFICATION_SCORE
+    if strong:
+        magnitude += MACD_RESONANCE_SCORE
+    if confirmed:
+        magnitude += MACD_CONFIRMATION_SCORE
+    raw_score = magnitude if side == "BULL" else -magnitude
+    return note, _macd_freshness_score(raw_score, age, timeframe)
 
 def weekly_j_lt_zero_candidate(
     tv_symbol: str,
@@ -511,7 +646,7 @@ def weekly_j_lt_zero_candidate(
     dif = clean_float(row.get("MACD_DIF"))
     dea = clean_float(row.get("MACD_DEA"))
     macd = None if dif is None or dea is None else ("DIF>=DEA" if dif >= dea else "DIF<DEA")
-    macd_div, _ = recent_macd_divergence(df)
+    macd_div, macd_div_score = recent_macd_divergence(df, timeframe="weekly")
     total_kdj_weight = KDJ_MAX_BONUS + WEEKLY_J_LT_ZERO_EXTRA_BONUS
     return Candidate(
         symbol=tv_symbol,
@@ -531,7 +666,8 @@ def weekly_j_lt_zero_candidate(
         prev_j=prev_j,
         macd=macd,
         macd_divergence=macd_div,
-        score=clamp_score(50 + total_kdj_weight),
+        macd_divergence_score=macd_div_score,
+        score=clamp_score(50 + total_kdj_weight + macd_div_score),
         kdj_note=note,
         source=source,
     )
@@ -577,7 +713,7 @@ def classify_frame(
     prev_j = clean_float(prev["J"])
     note, j_hook = kdj_note(j, prev_j)
     macd = "DIF>=DEA" if clean_float(row["MACD_DIF"]) is not None and clean_float(row["MACD_DEA"]) is not None and row["MACD_DIF"] >= row["MACD_DEA"] else "DIF<DEA"
-    macd_div, macd_div_score = recent_macd_divergence(df)
+    macd_div, macd_div_score = recent_macd_divergence(df, timeframe=timeframe)
     change = None
     prev_close = clean_float(prev["close"])
     if prev_close:
@@ -601,6 +737,7 @@ def classify_frame(
         prev_j=prev_j,
         macd=macd,
         macd_divergence=macd_div,
+        macd_divergence_score=macd_div_score,
         source=kdj_source,
     )
     candidates: list[Candidate] = []
@@ -778,6 +915,7 @@ def candidate_to_dict(c: Candidate) -> dict[str, Any]:
         "prev_j": c.prev_j,
         "macd": c.macd,
         "macd_divergence": c.macd_divergence,
+        "macd_divergence_score": c.macd_divergence_score,
         "score": c.score,
         "kdj_note": c.kdj_note,
         "fresh_pullback": c.fresh_pullback,
@@ -819,6 +957,24 @@ def self_test() -> None:
     assert kdj_from_stoch_values(57.2946126279, 73.8948034240) is not None
     assert kdj_j_bonus(-1.0) == KDJ_MAX_BONUS
     assert KDJ_MAX_BONUS + WEEKLY_J_LT_ZERO_EXTRA_BONUS == 50
+    dif_values = [0.0, 0.4, 0.8, 0.4, 0.0, -0.4, -0.8, -1.2, -1.7, -1.9, -2.2, -1.8, -1.2, -0.5, 0.0, -0.4, -0.8, -1.1, -1.4, -1.3, -1.6, -1.2, -0.8, -0.2, 0.2]
+    divergence_test = pd.DataFrame({
+        "high": [101.0] * len(dif_values),
+        "low": [99.0] * len(dif_values),
+        "close": [100.0] * len(dif_values),
+        "MACD_DIF": dif_values,
+        "MACD_DEA": [value + 0.2 for value in dif_values],
+        "MACD_HIST": [0.0] * len(dif_values),
+    })
+    divergence_test.loc[10, "low"] = 90.0
+    divergence_test.loc[20, "low"] = 80.0
+    divergence_test.loc[10, "MACD_HIST"] = -1.0
+    divergence_test.loc[20, "MACD_HIST"] = -0.5
+    divergence_test.loc[23, "MACD_DEA"] = dif_values[23] - 0.2
+    divergence_test.loc[24, "MACD_DEA"] = dif_values[24] - 0.2
+    div_note, div_score = recent_macd_divergence(divergence_test, timeframe="daily")
+    assert div_note == "MACD_DIF_STRONG_BULL_CONFIRMED@1bars"
+    assert div_score == MACD_MAX_SCORE
     print("self-test passed")
 
 
