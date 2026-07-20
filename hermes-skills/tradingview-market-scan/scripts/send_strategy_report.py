@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from market_scan_local import (
     DENSE,
     KDJ_MAX_BONUS,
+    MACD_MAX_SCORE,
     PULL20,
     PULL60,
     WEEKLY_J_LT_ZERO,
@@ -42,15 +43,19 @@ MACD_LABELS = {
 }
 
 DIV_LABELS = {
-    "MACD_BULL_DIV": "MACD底背离",
-    "MACD_HIDDEN_BULL_DIV": "MACD隐藏底背离",
-    "DIF_BULL_DIV": "DIF底背离",
-    "HIST_BULL_DIV": "柱体底背离",
-    "MACD_BEAR_DIV": "MACD顶背离压力",
-    "DIF_BEAR_DIV": "DIF顶背离压力",
-    "HIST_BEAR_DIV": "柱体顶背离压力",
+    "MACD_DIF_BULL_IDENTIFIED": "DIF底背识别，等待确认",
+    "MACD_DIF_STRONG_BULL_IDENTIFIED": "强底背识别（柱体共振），等待确认",
+    "MACD_DIF_BULL_CONFIRMED": "DIF底背正式确认",
+    "MACD_DIF_STRONG_BULL_CONFIRMED": "强底背正式确认（柱体共振）",
+    "MACD_DIF_BULL_EXPIRED": "DIF底背识别，确认窗口已过",
+    "MACD_DIF_STRONG_BULL_EXPIRED": "强底背识别（柱体共振），确认窗口已过",
+    "MACD_DIF_BEAR_IDENTIFIED": "DIF顶背识别，等待确认",
+    "MACD_DIF_STRONG_BEAR_IDENTIFIED": "强顶背识别（柱体共振），等待确认",
+    "MACD_DIF_BEAR_CONFIRMED": "DIF顶背正式确认",
+    "MACD_DIF_STRONG_BEAR_CONFIRMED": "强顶背正式确认（柱体共振）",
+    "MACD_DIF_BEAR_EXPIRED": "DIF顶背识别，确认窗口已过",
+    "MACD_DIF_STRONG_BEAR_EXPIRED": "强顶背识别（柱体共振），确认窗口已过",
 }
-
 KDJ_NOTE_LABELS = {
     "KDJ no data": "KDJ数据不足",
     "J<0": "J<0 极度低位",
@@ -125,8 +130,16 @@ def zh_divergence(divergence: object) -> str:
         return DIV_LABELS.get(text, text)
     key, bars = match.groups()
     label = DIV_LABELS.get(key, key)
-    return f"{label}（{bars}根K线前确认）"
+    if key.endswith("_CONFIRMED"):
+        return f"{label}（{bars}根K线前确认）"
+    return f"{label}（{bars}根K线前识别）"
 
+
+def fmt_macd_score(value: object) -> str:
+    try:
+        return f"{int(value):+d}分"
+    except (TypeError, ValueError):
+        return "0分"
 
 def zh_reason(reason: object) -> str:
     text = str(reason or "").strip()
@@ -209,7 +222,7 @@ def plain_candidates(title: str, rows: list[dict[str, object]]) -> list[str]:
             f"{idx}. {row.get('symbol')}｜{zh_kind(row.get('kind'))}｜评分 {row.get('score')}",
             f"收盘 {fmt_float(row.get('close'))}｜涨跌 {fmt_pct(row.get('change'))}｜J {fmt_float(row.get('j'), 1)}",
             f"KDJ：{zh_kdj_note(row.get('kdj_note'))}",
-            f"MACD：{zh_macd(row.get('macd'))}；{zh_divergence(row.get('macd_divergence'))}",
+            f"MACD：{zh_macd(row.get('macd'))}；{zh_divergence(row.get('macd_divergence'))}；计分 {fmt_macd_score(row.get('macd_divergence_score'))}",
             f"原因：{zh_reason(row.get('reason'))}",
         ]
         lines.extend(parts)
@@ -228,6 +241,7 @@ def card_html(row: dict[str, object], idx: int) -> str:
     kdj = esc(zh_kdj_note(row.get("kdj_note")))
     macd = esc(zh_macd(row.get("macd")))
     div = esc(zh_divergence(row.get("macd_divergence")))
+    macd_score = esc(fmt_macd_score(row.get("macd_divergence_score")))
     reason = esc(zh_reason(row.get("reason")))
     change_color = "#b42318" if str(change).startswith("-") else "#067647"
     return f"""
@@ -261,7 +275,7 @@ def card_html(row: dict[str, object], idx: int) -> str:
           </tr>
           <tr>
             <td style="padding:5px 0;color:#6b7280;">MACD辅助</td>
-            <td style="padding:5px 0;text-align:right;color:#111827;">{macd}；{div}</td>
+            <td style="padding:5px 0;text-align:right;color:#111827;">{macd}；{div}；计分 {macd_score}</td>
           </tr>
         </table>
         <div style="margin-top:10px;padding-top:10px;border-top:1px solid #f3f4f6;font-size:13px;line-height:1.55;color:#374151;">
@@ -379,14 +393,14 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
             f"1. 周线J<0：独立筛选全股票池，KDJ总权重 +{total_weekly_kdj_weight} 分，并在邮件置顶单列。",
             "2. 自选列表：均线密集需同时满足 ATR 压缩和六线跨度占比，且J值越小越加分。",
             "3. 回踩20周与60周均线并列，J值越小权重越高。",
-            "4. MACD背离仅作为辅助评分，不做硬筛选。",
+            f"4. MACD约占15%辅助权重，最高±{MACD_MAX_SCORE}分：DIF识别±4、柱体共振再±3、正式确认再±5；1周内全分，2至3周半分，超过3周只显示不计分。",
             "5. 加密列表的常规候选目前只看均线密集；周线J<0仍会进入置顶名单。",
         ]
     else:
         priority_lines = [
             f"1. 自选列表：均线密集需同时满足 ATR 压缩和六线跨度占比；J<20按深度加分，J<0时KDJ最高 +{KDJ_MAX_BONUS} 分。",
             "2. 回踩20日与60日均线并列；J值权重同上，若J值向上勾头再加15分。",
-            "3. MACD背离仅作为辅助评分，不做硬筛选。",
+            f"3. MACD约占15%辅助权重，最高±{MACD_MAX_SCORE}分：DIF识别±4、柱体共振再±3、正式确认再±5；3日内全分，4至7日半分，超过7日只显示不计分。",
             "4. 加密列表：目前只看均线密集；密集后J<0作为加分项。",
         ]
 
