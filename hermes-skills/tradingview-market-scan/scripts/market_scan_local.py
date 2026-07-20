@@ -2,8 +2,8 @@
 """Full OHLCV local recalculation scanner for the TradingView watch universe.
 
 Data source: yfinance OHLCV for moving averages, ATR and MACD. TradingView K/D
-snapshots are authoritative for J-based scoring, so chart and email triggers use
-the same data source.
+snapshots are preferred for J-based scoring. Missing snapshots automatically use
+a same-underlying alias or capped low-weight local KDJ fallback.
 """
 from __future__ import annotations
 
@@ -45,6 +45,12 @@ TRADINGVIEW_MARKET_ENDPOINTS = {
     "futures": "https://scanner.tradingview.com/futures/scan",
     "cfd": "https://scanner.tradingview.com/cfd/scan",
 }
+TRADINGVIEW_KDJ_ALIASES = {
+    "BOATS:DRAM": ("america", "CBOE:DRAM"),
+    "OANDA:XAGUSD": ("cfd", "TVC:SILVER"),
+}
+
+
 
 DENSE = "\u5747\u7ebf\u5bc6\u96c6"
 PULL20 = "\u56de\u8e2920"
@@ -53,6 +59,7 @@ WEEKLY_J_LT_ZERO = "\u5468\u7ebfJ<0"
 
 KDJ_MAX_BONUS = 35
 WEEKLY_J_LT_ZERO_EXTRA_BONUS = 15
+KDJ_FALLBACK_MAX_BONUS = 15
 
 # MACD remains an auxiliary score: identification +/-4, histogram resonance
 # another +/-3, and formal confirmation another +/-5 (maximum +/-12).
@@ -145,6 +152,7 @@ class Candidate:
     macd: str | None = None
     macd_divergence: str = ""
     macd_divergence_score: int = 0
+    kdj_weight_cap: int = KDJ_MAX_BONUS
     score: int = 0
     kdj_note: str = ""
     fresh_pullback: bool = False
@@ -219,12 +227,12 @@ def kdj_from_stoch_values(
     return j, prev_j
 
 
-def fetch_tradingview_kdj(
+def _fetch_tradingview_kdj_exact(
     market: str,
     tickers: list[str],
     timeframe: str,
 ) -> tuple[dict[str, tuple[float, float | None]], list[str]]:
-    """Fetch TradingView's K/D snapshot and derive the J value shown there."""
+    """Fetch exact TradingView K/D snapshots for one scanner market."""
     endpoint = TRADINGVIEW_MARKET_ENDPOINTS.get(market)
     if endpoint is None:
         return {}, [f"TradingView KDJ endpoint unavailable for market: {market}"]
@@ -252,6 +260,39 @@ def fetch_tradingview_kdj(
                 values_by_symbol[symbol] = values
     return values_by_symbol, errors
 
+
+def fetch_tradingview_kdj(
+    market: str,
+    tickers: list[str],
+    timeframe: str,
+) -> tuple[
+    dict[str, tuple[float, float | None]],
+    dict[str, str],
+    list[str],
+]:
+    """Fetch exact KDJ first, then try configured TradingView aliases."""
+    values_by_symbol, errors = _fetch_tradingview_kdj_exact(market, tickers, timeframe)
+    source_symbols = {symbol: symbol for symbol in values_by_symbol}
+    aliases_by_market: dict[str, list[tuple[str, str]]] = {}
+    for original_symbol in tickers:
+        if original_symbol in values_by_symbol:
+            continue
+        alias = TRADINGVIEW_KDJ_ALIASES.get(original_symbol)
+        if alias is None:
+            continue
+        alias_market, alias_symbol = alias
+        aliases_by_market.setdefault(alias_market, []).append((original_symbol, alias_symbol))
+
+    for alias_market, pairs in aliases_by_market.items():
+        alias_tickers = list(dict.fromkeys(alias_symbol for _, alias_symbol in pairs))
+        alias_values, alias_errors = _fetch_tradingview_kdj_exact(alias_market, alias_tickers, timeframe)
+        errors.extend(alias_errors)
+        for original_symbol, alias_symbol in pairs:
+            values = alias_values.get(alias_symbol)
+            if values is not None:
+                values_by_symbol[original_symbol] = values
+                source_symbols[original_symbol] = alias_symbol
+    return values_by_symbol, source_symbols, errors
 
 def apply_tradingview_kdj(
     df: pd.DataFrame,
@@ -621,6 +662,7 @@ def weekly_j_lt_zero_candidate(
     market: str,
     df: pd.DataFrame,
     source: str = "yfinance-local",
+    kdj_fallback: bool = False,
 ) -> Candidate | None:
     """Build the independent weekly J<0 candidate without requiring 120-week MAs."""
     if len(df) < 2:
@@ -647,7 +689,9 @@ def weekly_j_lt_zero_candidate(
     dea = clean_float(row.get("MACD_DEA"))
     macd = None if dif is None or dea is None else ("DIF>=DEA" if dif >= dea else "DIF<DEA")
     macd_div, macd_div_score = recent_macd_divergence(df, timeframe="weekly")
-    total_kdj_weight = KDJ_MAX_BONUS + WEEKLY_J_LT_ZERO_EXTRA_BONUS
+    total_kdj_weight = KDJ_FALLBACK_MAX_BONUS if kdj_fallback else KDJ_MAX_BONUS + WEEKLY_J_LT_ZERO_EXTRA_BONUS
+    weight_label = "\u5907\u7528\u4f4e\u6743\u91cd" if kdj_fallback else "\u6b63\u5f0f\u9ad8\u6743\u91cd"
+    tags = ["J<0"] + (["KDJ_FALLBACK"] if kdj_fallback else [])
     return Candidate(
         symbol=tv_symbol,
         yahoo=yahoo,
@@ -658,20 +702,20 @@ def weekly_j_lt_zero_candidate(
         density=density,
         kind=WEEKLY_J_LT_ZERO,
         reason=(
-            f"\u5468\u7ebfKDJ J\u503c{j:.1f}<0\uff0cKDJ\u9ad8\u6743\u91cd +{total_kdj_weight}\u5206\uff1b"
+            f"\u5468\u7ebfKDJ J\u503c{j:.1f}<0\uff0c{weight_label} +{total_kdj_weight}\u5206\uff1b"
             "\u8be5\u540d\u5355\u4e0d\u8981\u6c42\u540c\u65f6\u6ee1\u8db3\u5747\u7ebf\u5bc6\u96c6\u6216\u56de\u8e29\u6761\u4ef6"
         ),
-        tags=["J<0"],
+        tags=tags,
         j=j,
         prev_j=prev_j,
         macd=macd,
         macd_divergence=macd_div,
         macd_divergence_score=macd_div_score,
+        kdj_weight_cap=total_kdj_weight,
         score=clamp_score(50 + total_kdj_weight + macd_div_score),
         kdj_note=note,
         source=source,
     )
-
 
 def classify_frame(
     tv_symbol: str,
@@ -682,6 +726,7 @@ def classify_frame(
     crypto_dense_only: bool = False,
     timeframe: str = "daily",
     kdj_source: str = "yfinance-local",
+    kdj_fallback: bool = False,
 ) -> list[Candidate]:
     if len(df) < 130:
         return []
@@ -723,6 +768,16 @@ def classify_frame(
         tags.append("J<0")
     elif j is not None and j < 20:
         tags.append("J<20")
+    if kdj_fallback:
+        tags.append("KDJ_FALLBACK")
+
+    kdj_base_max_bonus = KDJ_FALLBACK_MAX_BONUS if kdj_fallback else KDJ_MAX_BONUS
+    weekly_j_extra_bonus = (
+        WEEKLY_J_LT_ZERO_EXTRA_BONUS
+        if not kdj_fallback and timeframe == "weekly" and j is not None and j < 0
+        else 0
+    )
+    kdj_weight_cap = kdj_base_max_bonus + weekly_j_extra_bonus
 
     base = dict(
         symbol=tv_symbol,
@@ -738,14 +793,14 @@ def classify_frame(
         macd=macd,
         macd_divergence=macd_div,
         macd_divergence_score=macd_div_score,
+        kdj_weight_cap=kdj_weight_cap,
         source=kdj_source,
     )
     candidates: list[Candidate] = []
-    weekly_j_extra_bonus = WEEKLY_J_LT_ZERO_EXTRA_BONUS if timeframe == "weekly" and j is not None and j < 0 else 0
 
     above_20_group = close > max(ma20, ema20)
     if above_20_group and density <= th.dense_atr and width_pct <= th.dense_width_pct and price_dist <= th.dense_price_atr:
-        kdj_bonus = kdj_j_bonus(j) + weekly_j_extra_bonus
+        kdj_bonus = kdj_j_bonus(j, max_bonus=kdj_base_max_bonus) + weekly_j_extra_bonus
         score = clamp_score(100 - (density / th.dense_atr) * 45 - (price_dist / th.dense_price_atr) * 30 + kdj_bonus + (5 if change and change > 0 else 0) + macd_div_score)
         candidates.append(Candidate(
             kind=DENSE,
@@ -783,8 +838,8 @@ def classify_frame(
         close_distance_atr = zone_distance(close, group_low, group_high) / atr
         low_distance_atr = zone_distance(low, group_low, group_high) / atr
         score = 44 + 15 + max(0, 10 - close_distance_atr * 12)
-        score += kdj_j_bonus(j) + weekly_j_extra_bonus
-        if j_hook:
+        score += kdj_j_bonus(j, max_bonus=kdj_base_max_bonus) + weekly_j_extra_bonus
+        if j_hook and not kdj_fallback:
             score += 15
         if change and change > 0:
             score += 3
@@ -838,7 +893,7 @@ def scan(symbol_file: Path, timeframe: str, th: Thresholds, crypto_dense_only: b
     if timeframe == "weekly":
         sections[WEEKLY_J_LT_ZERO] = []
     for market, tickers in symbols.items():
-        tradingview_kdj, tradingview_errors = fetch_tradingview_kdj(market, tickers, timeframe)
+        tradingview_kdj, tradingview_kdj_sources, tradingview_errors = fetch_tradingview_kdj(market, tickers, timeframe)
         errors.extend(tradingview_errors)
         for tv_symbol in tickers:
             yahoo = tv_to_yahoo(tv_symbol)
@@ -854,15 +909,43 @@ def scan(symbol_file: Path, timeframe: str, th: Thresholds, crypto_dense_only: b
                     continue
                 ind = add_indicators(df)
                 verified_kdj = tradingview_kdj.get(tv_symbol)
-                ind = apply_tradingview_kdj(ind, verified_kdj, required=timeframe == "weekly")
-                kdj_source = "yfinance-local+tradingview-kdj" if verified_kdj is not None else "yfinance-local"
-                if timeframe == "weekly" and verified_kdj is None:
-                    errors.append(
-                        f"TradingView KDJ unavailable: {tv_symbol}; weekly KDJ weight skipped"
-                    )
+                source_symbol = tradingview_kdj_sources.get(tv_symbol)
+                kdj_fallback = verified_kdj is None or source_symbol != tv_symbol
+                if verified_kdj is not None:
+                    ind = apply_tradingview_kdj(ind, verified_kdj)
+                    if source_symbol == tv_symbol:
+                        kdj_source = f"tradingview-kdj:{tv_symbol}"
+                    else:
+                        kdj_source = f"tradingview-kdj-fallback:{source_symbol}"
+                        if timeframe == "weekly":
+                            errors.append(
+                                f"KDJ备用：{tv_symbol} 使用 TradingView 同标的代码 {source_symbol}，"
+                                f"KDJ权重上限 +{KDJ_FALLBACK_MAX_BONUS} 分"
+                            )
+                else:
+                    kdj_source = "yfinance-local-kdj-fallback"
+                    local_j = clean_float(ind.iloc[-1].get("J"))
+                    if timeframe == "weekly":
+                        if local_j is not None:
+                            errors.append(
+                                f"KDJ备用：{tv_symbol} 使用 Yahoo 本地周线KDJ，"
+                                f"KDJ权重上限 +{KDJ_FALLBACK_MAX_BONUS} 分"
+                            )
+                        else:
+                            errors.append(
+                                f"KDJ不足：{tv_symbol} 的 TradingView 与 Yahoo 周线KDJ均不可用，"
+                                "本期不计KDJ分"
+                            )
                 rows_count += 1
                 if timeframe == "weekly":
-                    weekly_candidate = weekly_j_lt_zero_candidate(tv_symbol, yahoo, market, ind, source=kdj_source)
+                    weekly_candidate = weekly_j_lt_zero_candidate(
+                        tv_symbol,
+                        yahoo,
+                        market,
+                        ind,
+                        source=kdj_source,
+                        kdj_fallback=kdj_fallback,
+                    )
                     if weekly_candidate is not None:
                         sections[WEEKLY_J_LT_ZERO].append(weekly_candidate)
                 for cand in classify_frame(
@@ -874,6 +957,7 @@ def scan(symbol_file: Path, timeframe: str, th: Thresholds, crypto_dense_only: b
                     crypto_dense_only=crypto_dense_only,
                     timeframe=timeframe,
                     kdj_source=kdj_source,
+                    kdj_fallback=kdj_fallback,
                 ):
                     sections.setdefault(cand.kind, []).append(cand)
             except Exception as exc:
@@ -889,7 +973,7 @@ def scan(symbol_file: Path, timeframe: str, th: Thresholds, crypto_dense_only: b
             sections[key] = sorted(sections[key], key=lambda c: c.sort_tuple())[:th.max_items_per_section]
     return {
         "timeframe": timeframe,
-        "source": "yfinance-local-recalc+tradingview-kdj",
+        "source": "yfinance-local-recalc+tradingview-kdj-auto-fallback",
         "generated_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds"),
         "symbols_count": len(requested),
         "rows_count": rows_count,
@@ -916,6 +1000,7 @@ def candidate_to_dict(c: Candidate) -> dict[str, Any]:
         "macd": c.macd,
         "macd_divergence": c.macd_divergence,
         "macd_divergence_score": c.macd_divergence_score,
+        "kdj_weight_cap": c.kdj_weight_cap,
         "score": c.score,
         "kdj_note": c.kdj_note,
         "fresh_pullback": c.fresh_pullback,
@@ -954,6 +1039,17 @@ def self_test() -> None:
     weekly_candidate = weekly_j_lt_zero_candidate("NASDAQ:TEST", "TEST", "america", tradingview_negative)
     assert weekly_candidate is not None and weekly_candidate.kind == WEEKLY_J_LT_ZERO
     assert weekly_candidate.score == 100
+    fallback_candidate = weekly_j_lt_zero_candidate(
+        "NASDAQ:TEST",
+        "TEST",
+        "america",
+        tradingview_negative,
+        source="yfinance-local-kdj-fallback",
+        kdj_fallback=True,
+    )
+    assert fallback_candidate is not None and fallback_candidate.score == 65
+    assert fallback_candidate.kdj_weight_cap == KDJ_FALLBACK_MAX_BONUS
+    assert "KDJ_FALLBACK" in fallback_candidate.tags
     assert kdj_from_stoch_values(57.2946126279, 73.8948034240) is not None
     assert kdj_j_bonus(-1.0) == KDJ_MAX_BONUS
     assert KDJ_MAX_BONUS + WEEKLY_J_LT_ZERO_EXTRA_BONUS == 50
