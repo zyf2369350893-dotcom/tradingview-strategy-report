@@ -10,6 +10,7 @@ Automated daily and weekly TradingView strategy reports.
 - Crypto uses the official public API of the exact TradingView exchange prefix.
 - Cross-venue proxy mappings are excluded from strict reports.
 - KDJ scoring uses the custom RMA formula recalculated from validated OHLC; TradingView is a marked fallback only and is capped at 15 points.
+- Weekly priority score: 30 setup + dynamic KDJ up to 50 + MACD divergence up to +/-20, with separate bullish/bearish divergence badges.
 - Each candidate includes its bar date, source, and quality status.
 - Default recipient: zyf18236610022@qq.com.
 

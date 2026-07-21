@@ -20,6 +20,8 @@ from market_scan_local import (
     KDJ_FALLBACK_MAX_BONUS,
     KDJ_MAX_BONUS,
     MACD_MAX_SCORE,
+    WEEKLY_MACD_MAX_SCORE,
+    WEEKLY_PRIORITY_BASE_SCORE,
     PULL20,
     PULL60,
     WEEKLY_J_LT_ZERO,
@@ -145,6 +147,39 @@ def fmt_macd_score(value: object) -> str:
         return "0分"
 
 
+def macd_divergence_badge(note: object, score: object) -> tuple[str, str]:
+    text = str(note or "")
+    try:
+        points = int(score or 0)
+    except (TypeError, ValueError):
+        points = 0
+    if "_BULL_" in text:
+        if points == 0:
+            return "MACD\u5e95\u80cc\u79bb\uff08\u5386\u53f2\u6807\u8bb0\uff0c\u672c\u671f 0 \u5206\uff09", "bull"
+        label = f"MACD\u5e95\u80cc\u79bb\uff08\u6284\u5e95\u52a0\u5206 {points:+d}\uff09"
+        return label, "bull"
+    if "_BEAR_" in text:
+        label = f"MACD\u9876\u80cc\u79bb\uff08\u98ce\u9669\u6263\u5206 {points:+d}\uff09"
+        if points == 0:
+            return "MACD\u9876\u80cc\u79bb\uff08\u5386\u53f2\u6807\u8bb0\uff0c\u672c\u671f 0 \u5206\uff09", "bear"
+        return label, "bear"
+    return "", ""
+
+
+def macd_badge_html(note: object, score: object) -> str:
+    label, side = macd_divergence_badge(note, score)
+    if not label:
+        return ""
+    if side == "bull":
+        background, color = "#ecfdf3", "#067647"
+    else:
+        background, color = "#fef3f2", "#b42318"
+    return (
+        f'<span style="display:inline-block;background:{background};color:{color};border-radius:999px;'
+        f'padding:4px 9px;font-size:12px;font-weight:700;margin-left:4px;">{esc(label)}</span>'
+    )
+
+
 def zh_kdj_source(source: object) -> str:
     text = str(source or "").strip()
     if "KDJ=" in text:
@@ -265,6 +300,9 @@ def plain_candidates(title: str, rows: list[dict[str, object]]) -> list[str]:
             f"MACD：{zh_macd(row.get('macd'))}；{zh_divergence(row.get('macd_divergence'))}；计分 {fmt_macd_score(row.get('macd_divergence_score'))}",
             f"原因：{zh_reason(row.get('reason'))}",
         ]
+        macd_badge, _ = macd_divergence_badge(row.get("macd_divergence"), row.get("macd_divergence_score"))
+        if macd_badge:
+            parts.insert(4, f"MACD\u80cc\u79bb\u6807\u8bb0\uff1a{macd_badge}")
         parts.insert(-1, f"K\u7ebf\u65e5\u671f\uff1a{row.get('bar_date') or '-'}\uff5c\u72b6\u6001\uff1a\u5df2\u6536\u76d8\u786e\u8ba4")
         parts.insert(-1, f"\u6570\u636e\u6e90\uff1a{row.get('source') or '-'}")
         parts.insert(-1, f"\u8d28\u68c0\uff1a{row.get('data_quality') or '-'}")
@@ -287,6 +325,7 @@ def card_html(row: dict[str, object], idx: int) -> str:
     macd = esc(zh_macd(row.get("macd")))
     div = esc(zh_divergence(row.get("macd_divergence")))
     macd_score = esc(fmt_macd_score(row.get("macd_divergence_score")))
+    macd_badge = macd_badge_html(row.get("macd_divergence"), row.get("macd_divergence_score"))
     reason = esc(zh_reason(row.get("reason")))
     bar_date = esc(row.get("bar_date") or "-")
     source = esc(row.get("source") or "-")
@@ -307,6 +346,7 @@ def card_html(row: dict[str, object], idx: int) -> str:
         <div style="margin-top:10px;">
           <span style="display:inline-block;background:#eef2ff;color:#3730a3;border-radius:999px;padding:4px 9px;font-size:12px;font-weight:700;">{kind}</span>
           <span style="display:inline-block;background:#f3f4f6;color:#374151;border-radius:999px;padding:4px 9px;font-size:12px;margin-left:4px;">KDJ：{kdj}</span>
+          {macd_badge}
         </div>
         <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;margin-top:12px;border-collapse:collapse;font-size:13px;color:#374151;">
           <tr>
@@ -382,9 +422,11 @@ def weekly_priority_html(rows: list[dict[str, object]]) -> str:
     """
     old_description = f"TradingView\u6b63\u5f0fKDJ\u6700\u9ad8 +{total_weight} \u5206\uff1b\u5907\u7528KDJ\u6700\u9ad8 +{KDJ_FALLBACK_MAX_BONUS} \u5206\u3002\u6b63\u5f0f\u6570\u636e\u4f18\u5148\uff0c\u518d\u6309J\u503c\u4ece\u4f4e\u5230\u9ad8\u6392\u5217\uff1b\u53ef\u80fd\u4e0e\u4e0b\u65b9\u5e38\u89c4\u5019\u9009\u91cd\u590d\u3002"
     new_description = (
-        f"\u672c\u5730\u81ea\u5b9a\u4e49KDJ\u6b63\u5f0f\u503c\u6700\u9ad8 +{total_weight} \u5206\uff1b"
+        f"\u5468\u7ebfJ<0\u57fa\u7840\u6761\u4ef6 +{WEEKLY_PRIORITY_BASE_SCORE} \u5206\uff1b"
+        f"\u672c\u5730\u81ea\u5b9a\u4e49KDJ\u6309J\u503c\u6df1\u5ea6\u548c\u62d0\u5934\u52a8\u6001\u53d6\u5206\uff0c\u6700\u9ad8 +{total_weight} \u5206\uff1b"
         f"TradingView\u5907\u7528KDJ\u6700\u9ad8 +{KDJ_FALLBACK_MAX_BONUS} \u5206\u3002"
         "\u6b63\u5f0f\u503c\u4f18\u5148\uff0c\u518d\u6309J\u503c\u4ece\u4f4e\u5230\u9ad8\u6392\u5217\uff1b\u53ef\u80fd\u4e0e\u4e0b\u65b9\u5e38\u89c4\u5019\u9009\u91cd\u590d\u3002"
+        f"\u5468\u7ebfMACD\u5e95\u80cc\u79bb\u6700\u9ad8 +{WEEKLY_MACD_MAX_SCORE}\u3001\u9876\u80cc\u79bb\u6700\u4f4e -{WEEKLY_MACD_MAX_SCORE}\u3002"
     )
     return html_text.replace(old_description, new_description)
 
@@ -477,8 +519,13 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
 
     if report_type == "weekly":
         priority_lines[0] = (
-            f"1. \u5468\u7ebfJ<0\uff1a\u62c6\u5206/\u590d\u6743\u6821\u6b63\u540e\u7684\u81ea\u5b9a\u4e49KDJ\u4e3a\u6b63\u5f0f\u503c\uff0c\u6700\u9ad8 +{total_weekly_kdj_weight} \u5206\uff1b"
+            f"1. \u5468\u7ebfJ<0\uff1a\u57fa\u7840\u6761\u4ef6 +{WEEKLY_PRIORITY_BASE_SCORE} \u5206\uff1b\u62c6\u5206/\u590d\u6743\u6821\u6b63\u540e\u7684\u81ea\u5b9a\u4e49KDJ\u4e3a\u6b63\u5f0f\u503c\uff0c"
+            f"\u6309J\u503c\u6df1\u5ea6\u548c\u62d0\u5934\u52a8\u6700\u9ad8 +{total_weekly_kdj_weight} \u5206\uff1b"
             f"\u7f3a\u6570\u65f6\u4f7f\u7528TradingView\u5907\u7528\u4e14\u6700\u9ad8 +{KDJ_FALLBACK_MAX_BONUS} \u5206\uff0c\u6b63\u5f0f\u503c\u4f18\u5148\u7f6e\u9876\u3002"
+        )
+        priority_lines[3] = (
+            f"4. \u5468\u7ebfMACD\u80cc\u79bb\u5355\u72ec\u8ba1\u5206\uff0c\u6700\u9ad8\u00b1{WEEKLY_MACD_MAX_SCORE}\u5206\uff1aDIF\u8bc6\u522b\u00b16\u3001\u67f1\u4f53\u5171\u632f\u518d\u00b14\u3001"
+            "\u91d1\u53c9/\u7ed3\u6784\u7a81\u7834\u786e\u8ba4\u518d\u00b110\uff1b1\u5468\u5185\u5168\u5206\uff0c2\u81f33\u5468\u534a\u5206\uff0c\u8d85\u8fc73\u5468\u53ea\u6807\u6ce8\u4e0d\u8ba1\u5206\u3002"
         )
 
     precision_header = [

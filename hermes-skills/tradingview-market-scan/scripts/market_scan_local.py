@@ -66,13 +66,25 @@ KDJ_FALLBACK_MAX_BONUS = 15
 KDJ_N = 9
 KDJ_M1 = 3
 KDJ_M2 = 3
-FORMULA_VERSION = "2026-07-21-v4"
+FORMULA_VERSION = "2026-07-21-v5"
 INDICATOR_SPEC = "KDJ(9,3,3,RMA); SMA/EMA(20,60,120); ATR(14,RMA); MACD(12,26,9,EMA)"
 
 MACD_IDENTIFICATION_SCORE = 4
 MACD_RESONANCE_SCORE = 3
 MACD_CONFIRMATION_SCORE = 5
 MACD_MAX_SCORE = MACD_IDENTIFICATION_SCORE + MACD_RESONANCE_SCORE + MACD_CONFIRMATION_SCORE
+WEEKLY_MACD_IDENTIFICATION_SCORE = 6
+WEEKLY_MACD_RESONANCE_SCORE = 4
+WEEKLY_MACD_CONFIRMATION_SCORE = 10
+WEEKLY_MACD_MAX_SCORE = (
+    WEEKLY_MACD_IDENTIFICATION_SCORE
+    + WEEKLY_MACD_RESONANCE_SCORE
+    + WEEKLY_MACD_CONFIRMATION_SCORE
+)
+WEEKLY_PRIORITY_BASE_SCORE = 30
+WEEKLY_KDJ_MIN_SCORE = 25
+WEEKLY_KDJ_DEPTH_MAX_SCORE = 20
+WEEKLY_KDJ_HOOK_SCORE = 5
 MACD_PIVOT_LEFT = 5
 MACD_PIVOT_RIGHT = 2
 MACD_MIN_BARS = 5
@@ -1145,6 +1157,24 @@ def _macd_freshness_score(raw_score: int, age: int, timeframe: str) -> int:
         return round(raw_score * 0.5)
     return 0
 
+def weekly_kdj_priority_score(j: float | None, prev_j: float | None, max_score: int = 50) -> int:
+    """Score weekly J<0 by depth and hook instead of awarding a fixed 50."""
+    if j is None or j >= 0:
+        return 0
+    depth_score = min(WEEKLY_KDJ_DEPTH_MAX_SCORE, max(0, round(-j)))
+    hook_score = WEEKLY_KDJ_HOOK_SCORE if prev_j is not None and j > prev_j else 0
+    raw_score = WEEKLY_KDJ_MIN_SCORE + depth_score + hook_score
+    return max(0, min(max_score, raw_score))
+
+
+def macd_divergence_side(note: str) -> str:
+    if "_BULL_" in note:
+        return "BULL"
+    if "_BEAR_" in note:
+        return "BEAR"
+    return ""
+
+
 
 def recent_macd_divergence(
     df: pd.DataFrame,
@@ -1307,11 +1337,20 @@ def recent_macd_divergence(
     stage = "CONFIRMED" if confirmed else ("EXPIRED" if expired else "IDENTIFIED")
     strength = "STRONG_" if strong else ""
     note = f"MACD_DIF_{strength}{side}_{stage}@{age}bars"
-    magnitude = MACD_IDENTIFICATION_SCORE
+    if timeframe == "weekly":
+        identification_score = WEEKLY_MACD_IDENTIFICATION_SCORE
+        resonance_score = WEEKLY_MACD_RESONANCE_SCORE
+        confirmation_score = WEEKLY_MACD_CONFIRMATION_SCORE
+    else:
+        identification_score = MACD_IDENTIFICATION_SCORE
+        resonance_score = MACD_RESONANCE_SCORE
+        confirmation_score = MACD_CONFIRMATION_SCORE
+
+    magnitude = identification_score
     if strong:
-        magnitude += MACD_RESONANCE_SCORE
+        magnitude += resonance_score
     if confirmed:
-        magnitude += MACD_CONFIRMATION_SCORE
+        magnitude += confirmation_score
     raw_score = magnitude if side == "BULL" else -magnitude
     return note, _macd_freshness_score(raw_score, age, timeframe)
 
@@ -1349,8 +1388,17 @@ def weekly_j_lt_zero_candidate(
     macd = None if dif is None or dea is None else ("DIF>=DEA" if dif >= dea else "DIF<DEA")
     macd_div, macd_div_score = recent_macd_divergence(df, timeframe="weekly")
     total_kdj_weight = KDJ_FALLBACK_MAX_BONUS if kdj_fallback else KDJ_MAX_BONUS + WEEKLY_J_LT_ZERO_EXTRA_BONUS
+    formal_kdj_score = weekly_kdj_priority_score(j, prev_j, max_score=50)
+    kdj_score = (
+        min(KDJ_FALLBACK_MAX_BONUS, round(formal_kdj_score * KDJ_FALLBACK_MAX_BONUS / 50))
+        if kdj_fallback
+        else formal_kdj_score
+    )
     weight_label = "\u5907\u7528\u4f4e\u6743\u91cd" if kdj_fallback else "\u6b63\u5f0f\u9ad8\u6743\u91cd"
     tags = ["J<0"] + (["KDJ_FALLBACK"] if kdj_fallback else [])
+    divergence_side = macd_divergence_side(macd_div)
+    if divergence_side:
+        tags.append(f"MACD_{divergence_side}_DIV")
     return Candidate(
         symbol=tv_symbol,
         yahoo=yahoo,
@@ -1361,7 +1409,7 @@ def weekly_j_lt_zero_candidate(
         density=density,
         kind=WEEKLY_J_LT_ZERO,
         reason=(
-            f"\u5468\u7ebfKDJ J\u503c{j:.1f}<0\uff0c{weight_label} +{total_kdj_weight}\u5206\uff1b"
+            f"\u5468\u7ebfKDJ J\u503c{j:.1f}<0\uff0c{weight_label} +{kdj_score}/{total_kdj_weight}\u5206\uff1b"
             "\u8be5\u540d\u5355\u4e0d\u8981\u6c42\u540c\u65f6\u6ee1\u8db3\u5747\u7ebf\u5bc6\u96c6\u6216\u56de\u8e29\u6761\u4ef6"
         ),
         tags=tags,
@@ -1371,7 +1419,7 @@ def weekly_j_lt_zero_candidate(
         macd_divergence=macd_div,
         macd_divergence_score=macd_div_score,
         kdj_weight_cap=total_kdj_weight,
-        score=clamp_score(50 + total_kdj_weight + macd_div_score),
+        score=clamp_score(WEEKLY_PRIORITY_BASE_SCORE + kdj_score + macd_div_score),
         kdj_note=note,
         source=f"{df.attrs.get('source', 'unknown')}; KDJ={source}",
         bar_date=latest_bar_date(df),
@@ -1431,6 +1479,9 @@ def classify_frame(
         tags.append("J<20")
     if kdj_fallback:
         tags.append("KDJ_FALLBACK")
+    divergence_side = macd_divergence_side(macd_div)
+    if divergence_side:
+        tags.append(f"MACD_{divergence_side}_DIV")
 
     kdj_base_max_bonus = KDJ_FALLBACK_MAX_BONUS if kdj_fallback else KDJ_MAX_BONUS
     weekly_j_extra_bonus = (
@@ -1828,7 +1879,7 @@ def self_test() -> None:
     tradingview_negative = apply_tradingview_kdj(weekly_test, (-5.0, -8.0), required=True)
     weekly_candidate = weekly_j_lt_zero_candidate("NASDAQ:TEST", "TEST", "america", tradingview_negative)
     assert weekly_candidate is not None and weekly_candidate.kind == WEEKLY_J_LT_ZERO
-    assert weekly_candidate.score == 100
+    assert weekly_candidate.score == 65
     assert weekly_candidate.bar_status == "confirmed"
     assert weekly_candidate.bar_date == dates[-1].date().isoformat()
     fallback_candidate = weekly_j_lt_zero_candidate(
@@ -1839,7 +1890,7 @@ def self_test() -> None:
         source="yfinance-local-kdj-fallback",
         kdj_fallback=True,
     )
-    assert fallback_candidate is not None and fallback_candidate.score == 65
+    assert fallback_candidate is not None and fallback_candidate.score == 40
     assert fallback_candidate.kdj_weight_cap == KDJ_FALLBACK_MAX_BONUS
     assert "KDJ_FALLBACK" in fallback_candidate.tags
     assert kdj_from_stoch_values(57.2946126279, 73.8948034240) is not None
@@ -1863,6 +1914,12 @@ def self_test() -> None:
     div_note, div_score = recent_macd_divergence(divergence_test, timeframe="daily")
     assert div_note == "MACD_DIF_STRONG_BULL_CONFIRMED@1bars"
     assert div_score == MACD_MAX_SCORE
+    weekly_div_note, weekly_div_score = recent_macd_divergence(divergence_test, timeframe="weekly")
+    assert weekly_div_note == "MACD_DIF_STRONG_BULL_CONFIRMED@1bars"
+    assert weekly_div_score == WEEKLY_MACD_MAX_SCORE
+    assert macd_divergence_side(weekly_div_note) == "BULL"
+    assert weekly_kdj_priority_score(-1.0, -2.0) == 31
+    assert weekly_kdj_priority_score(-25.0, -30.0) == 50
     print("self-test passed")
 
 
