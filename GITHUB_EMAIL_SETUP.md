@@ -4,8 +4,8 @@ This repo contains a GitHub Actions workflow for the TradingView strategy report
 
 ## Schedule
 
-- Daily report: Beijing time 06:30, Monday to Saturday.
-- Weekly report: Beijing time 06:30, Sunday.
+- Daily report: Beijing time 09:10 every day.
+- Weekly report: Beijing time 09:25, Monday.
 
 ## Required GitHub Secrets
 

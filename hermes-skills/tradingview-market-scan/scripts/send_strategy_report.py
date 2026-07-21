@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 
 from market_scan_local import (
     DENSE,
+    FORMULA_VERSION,
+    INDICATOR_SPEC,
     KDJ_MAX_BONUS,
     PULL20,
     PULL60,
@@ -200,6 +202,13 @@ def missing_text(result: dict[str, object]) -> str:
     return "、".join(str(item) for item in missing)
 
 
+def excluded_text(result: dict[str, object]) -> str:
+    excluded = result.get("excluded_symbols") or []
+    if not excluded:
+        return "\u65e0"
+    return "; ".join(str(item) for item in excluded)
+
+
 def plain_candidates(title: str, rows: list[dict[str, object]]) -> list[str]:
     lines = [title]
     if not rows:
@@ -212,6 +221,9 @@ def plain_candidates(title: str, rows: list[dict[str, object]]) -> list[str]:
             f"MACD：{zh_macd(row.get('macd'))}；{zh_divergence(row.get('macd_divergence'))}",
             f"原因：{zh_reason(row.get('reason'))}",
         ]
+        parts.insert(-1, f"K\u7ebf\u65e5\u671f\uff1a{row.get('bar_date') or '-'}\uff5c\u72b6\u6001\uff1a\u5df2\u6536\u76d8\u786e\u8ba4")
+        parts.insert(-1, f"\u6570\u636e\u6e90\uff1a{row.get('source') or '-'}")
+        parts.insert(-1, f"\u8d28\u68c0\uff1a{row.get('data_quality') or '-'}")
         lines.extend(parts)
         lines.append("")
     return lines
@@ -229,6 +241,9 @@ def card_html(row: dict[str, object], idx: int) -> str:
     macd = esc(zh_macd(row.get("macd")))
     div = esc(zh_divergence(row.get("macd_divergence")))
     reason = esc(zh_reason(row.get("reason")))
+    bar_date = esc(row.get("bar_date") or "-")
+    source = esc(row.get("source") or "-")
+    quality = esc(row.get("data_quality") or "-")
     change_color = "#b42318" if str(change).startswith("-") else "#067647"
     return f"""
       <div style="border:1px solid #e5e7eb;border-radius:8px;padding:14px 14px 12px;margin:10px 0;background:#ffffff;">
@@ -263,9 +278,16 @@ def card_html(row: dict[str, object], idx: int) -> str:
             <td style="padding:5px 0;color:#6b7280;">MACD辅助</td>
             <td style="padding:5px 0;text-align:right;color:#111827;">{macd}；{div}</td>
           </tr>
+          <tr>
+            <td style="padding:5px 0;color:#6b7280;">K\u7ebf\u65e5\u671f</td>
+            <td style="padding:5px 0;text-align:right;color:#111827;">{bar_date}\uff08\u5df2\u6536\u76d8\uff09</td>
+          </tr>
         </table>
         <div style="margin-top:10px;padding-top:10px;border-top:1px solid #f3f4f6;font-size:13px;line-height:1.55;color:#374151;">
           <strong style="color:#111827;">入选原因：</strong>{reason}
+        </div>
+        <div style="margin-top:6px;color:#6b7280;font-size:12px;line-height:1.5;">
+          \u6570\u636e\u6e90\uff1a{source}<br>\u8d28\u68c0\uff1a{quality}
         </div>
       </div>
     """
@@ -281,11 +303,15 @@ def section_html(title: str, result: dict[str, object], rows: list[dict[str, obj
     returned = esc(result.get("rows_count"))
     total = esc(result.get("symbols_count"))
     missing = esc(missing_text(result))
+    excluded = esc(excluded_text(result))
     return f"""
       <section style="margin-top:22px;">
         <h2 style="font-size:18px;margin:0 0 10px;color:#111827;">{esc(title)}</h2>
         <div style="font-size:13px;color:#4b5563;margin-bottom:10px;">
           数据返回：<strong>{returned}/{total}</strong>　未返回/数据不足：<strong>{missing}</strong>
+        </div>
+        <div style="font-size:12px;color:#6b7280;margin:-4px 0 10px;">
+          \u4e25\u683c\u6a21\u5f0f\u6392\u9664\u7684\u4ee3\u7406\u54c1\u79cd\uff1a{excluded}
         </div>
         {cards_html(rows)}
       </section>
@@ -335,11 +361,17 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
             "4. 加密列表：目前只看均线密集；密集后J<0作为加分项。",
         ]
 
-    plain_lines = [
+    precision_header = [
+        f"\u7cbe\u5ea6\u7248\u672c\uff1a{FORMULA_VERSION}",
+        f"\u6307\u6807\u516c\u5f0f\uff1a{INDICATOR_SPEC}",
+        "\u53ea\u4f7f\u7528\u5df2\u6536\u76d8K\u7ebf\uff1b\u666e\u901a\u80a1\u7968/\u6307\u6570Yahoo repair=True\uff1bA\u80a1ETF\u4e1c\u65b9\u8d22\u5bcc/\u65b0\u6d6a\uff1b\u52a0\u5bc6\u8d27\u5e01\u6307\u5b9a\u4ea4\u6613\u6240\u5b98\u65b9API\uff1b\u5f02\u5e38OHLC\u4e0d\u53c2\u4e0e\u7b5b\u9009",
+        "\u8bc4\u5206\u662f\u7b56\u7565\u6392\u5e8f\uff0c\u4e0d\u662f\u884c\u60c5\u6570\u636e\u7cbe\u5ea6",
+    ]
+    plain_lines = [*precision_header,
         f"TradingView策略{report_name}",
         f"生成时间：{now} 北京时间",
         f"周期：{timeframe_name}",
-        "数据源：Yahoo Finance/yfinance 完整K线；SMA/EMA、KDJ、MACD由本地重新计算",
+        "\u6570\u636e\u6e90\uff1a\u666e\u901a\u80a1\u7968/\u6307\u6570Yahoo\u4fee\u590dK\u7ebf\uff1bA\u80a1ETF\u4e1c\u65b9\u8d22\u5bcc/\u65b0\u6d6a\uff1b\u52a0\u5bc6\u8d27\u5e01\u7b26\u53f7\u5bf9\u5e94\u4ea4\u6613\u6240\u5b98\u65b9API\uff1b\u6307\u6807\u672c\u5730\u91cd\u7b97",
         "",
         "筛选优先级：",
         *priority_lines,
@@ -355,6 +387,8 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
     plain_lines.append(f"加密列表：数据返回 {crypto.get('rows_count')}/{crypto.get('symbols_count')}；未返回/数据不足：{missing_text(crypto)}")
     plain_lines.extend(plain_candidates("加密列表均线密集", crypto_rows))
 
+    plain_lines.append(f"\u4e25\u683c\u6a21\u5f0f\u6392\u9664\uff08\u81ea\u9009\uff09\uff1a{excluded_text(watch)}")
+    plain_lines.append(f"\u4e25\u683c\u6a21\u5f0f\u6392\u9664\uff08\u52a0\u5bc6\uff09\uff1a{excluded_text(crypto)}")
     errors = list(watch.get("errors") or []) + list(crypto.get("errors") or [])
     if errors:
         plain_lines.append("数据备注：")
@@ -384,6 +418,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
     priority_html_items = "".join(f"<li>{esc(item[3:])}</li>" for item in priority_lines)
     weekly_priority_section = weekly_priority_html(weekly_priority_rows) if report_type == "weekly" else ""
 
+    precision_html = f'<div style="background:#ecfdf3;border:1px solid #abefc6;border-radius:10px;margin-top:12px;padding:12px 16px;color:#05603a;font-size:13px;line-height:1.6;"><strong>\u7cbe\u5ea6\u7248\u672c {FORMULA_VERSION}</strong><br>{esc(INDICATOR_SPEC)}<br>\u4ec5\u5df2\u6536\u76d8K\u7ebf\uff5c\u666e\u901a\u80a1\u7968/\u6307\u6570Yahoo repair=True\uff5cA\u80a1ETF\u4e1c\u65b9\u8d22\u5bcc/\u65b0\u6d6a\uff5c\u52a0\u5bc6\u8d27\u5e01\u6307\u5b9a\u4ea4\u6613\u6240\u5b98\u65b9API</div>'
     html_body = f"""<!doctype html>
 <html>
   <body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,'Microsoft YaHei',sans-serif;color:#111827;">
@@ -402,6 +437,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
       </div>
 
       {weekly_priority_section}
+      {precision_html}
       {section_html("自选列表候选", watch, watch_rows)}
       {section_html("加密列表均线密集", crypto, crypto_rows)}
       {error_html}
@@ -410,7 +446,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
         <strong>风险提醒：</strong>本报告只是技术筛选和复盘参考，不构成买卖建议。实际交易前请再核对券商/交易所实时行情、流动性和自身风险承受能力。
       </div>
       <div style="margin:12px 2px 0;color:#6b7280;font-size:12px;line-height:1.5;">
-        数据源：Yahoo Finance/yfinance 完整K线；SMA/EMA、KDJ、MACD由脚本本地重新计算。
+        \u6570\u636e\u6e90\uff1a\u666e\u901a\u80a1\u7968/\u6307\u6570Yahoo\u4fee\u590dK\u7ebf\uff1bA\u80a1ETF\u4e1c\u65b9\u8d22\u5bcc/\u65b0\u6d6a\uff1b\u52a0\u5bc6\u8d27\u5e01\u7b26\u53f7\u5bf9\u5e94\u4ea4\u6613\u6240\u5b98\u65b9API\uff1b\u6307\u6807\u672c\u5730\u91cd\u7b97\u3002
       </div>
     </div>
   </body>
@@ -428,12 +464,26 @@ def send_email(subject: str, plain_body: str, html_body: str, dry_run: bool = Fa
     mail_to = os.environ.get("MAIL_TO") or "zyf18236610022@qq.com"
     use_tls = os.environ.get("SMTP_TLS", "true").lower() != "false"
 
-    if dry_run or not all([host, user, password, mail_from, mail_to]):
+    if dry_run:
         print("[DRY-RUN] 邮件未发送；已生成中文 HTML 邮件。")
         print("Subject:", subject)
         print(plain_body)
         print(f"[DRY-RUN] HTML length: {len(html_body)} bytes")
         return False
+
+    missing = [
+        name
+        for name, value in {
+            "SMTP_HOST": host,
+            "SMTP_USER": user,
+            "SMTP_PASSWORD": password,
+            "MAIL_FROM": mail_from,
+            "MAIL_TO": mail_to,
+        }.items()
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(f"邮件未发送，缺少配置：{', '.join(missing)}")
 
     msg = EmailMessage()
     msg["Subject"] = subject

@@ -3,7 +3,7 @@
     "NASDAQ:NDX",
     "NASDAQ:NVDA",
     "NASDAQ:MU",
-    "BOATS:DRAM",
+    "NASDAQ:DRAM",
     "NASDAQ:MRVL",
     "NASDAQ:AVGO",
     "NYSE:TSM",
@@ -39,12 +39,5 @@
   ],
   "crypto": [
     "COINBASE:BTCUSD"
-  ],
-  "futures": [
-    "CME:BTC1!"
-  ],
-  "cfd": [
-    "OANDA:XAUUSD",
-    "OANDA:XAGUSD"
   ]
 }
