@@ -14,6 +14,7 @@ import math
 import os
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import contextlib
@@ -38,6 +39,21 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_SYMBOLS = ROOT / "symbols.json"
 DEFAULT_STATE_DIR = Path(os.environ.get("TV_SCAN_STATE_DIR", ROOT.parent.parent.parent / "automation" / "state"))
 YF_CACHE_DIR = ROOT.parent.parent.parent / "data" / "yfinance-cache"
+TRADINGVIEW_MARKET_ENDPOINTS = {
+    "america": "https://scanner.tradingview.com/america/scan",
+    "china": "https://scanner.tradingview.com/china/scan",
+    "hongkong": "https://scanner.tradingview.com/hongkong/scan",
+    "korea": "https://scanner.tradingview.com/korea/scan",
+    "crypto": "https://scanner.tradingview.com/crypto/scan",
+    "futures": "https://scanner.tradingview.com/futures/scan",
+    "cfd": "https://scanner.tradingview.com/cfd/scan",
+}
+TRADINGVIEW_KDJ_ALIASES = {
+    "BOATS:DRAM": ("america", "CBOE:DRAM"),
+    "OANDA:XAGUSD": ("cfd", "TVC:SILVER"),
+}
+
+
 
 DENSE = "\u5747\u7ebf\u5bc6\u96c6"
 PULL20 = "\u56de\u8e2920"
@@ -46,11 +62,22 @@ WEEKLY_J_LT_ZERO = "\u5468\u7ebfJ<0"
 
 KDJ_MAX_BONUS = 35
 WEEKLY_J_LT_ZERO_EXTRA_BONUS = 15
+KDJ_FALLBACK_MAX_BONUS = 15
 KDJ_N = 9
 KDJ_M1 = 3
 KDJ_M2 = 3
-FORMULA_VERSION = "2026-07-21-v3"
+FORMULA_VERSION = "2026-07-21-v4"
 INDICATOR_SPEC = "KDJ(9,3,3,RMA); SMA/EMA(20,60,120); ATR(14,RMA); MACD(12,26,9,EMA)"
+
+MACD_IDENTIFICATION_SCORE = 4
+MACD_RESONANCE_SCORE = 3
+MACD_CONFIRMATION_SCORE = 5
+MACD_MAX_SCORE = MACD_IDENTIFICATION_SCORE + MACD_RESONANCE_SCORE + MACD_CONFIRMATION_SCORE
+MACD_PIVOT_LEFT = 5
+MACD_PIVOT_RIGHT = 2
+MACD_MIN_BARS = 5
+MACD_MAX_BARS = 80
+MACD_CONFIRMATION_WINDOW = 12
 
 YAHOO_OVERRIDES = {
     "NASDAQ:NDX": "^NDX",
@@ -197,6 +224,8 @@ class Candidate:
     prev_j: float | None = None
     macd: str | None = None
     macd_divergence: str = ""
+    macd_divergence_score: int = 0
+    kdj_weight_cap: int = KDJ_MAX_BONUS
     score: int = 0
     kdj_note: str = ""
     fresh_pullback: bool = False
@@ -226,6 +255,142 @@ def clean_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return None if math.isnan(result) or math.isinf(result) else result
+
+
+def chunked(items: list[str], size: int) -> list[list[str]]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def post_json(url: str, payload: dict[str, Any], timeout: int = 20) -> dict[str, Any]:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 strategy-report/1.0",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def tradingview_kdj_columns(timeframe: str) -> list[str]:
+    base = ["Stoch.K", "Stoch.D", "Stoch.K[1]", "Stoch.D[1]"]
+    if timeframe == "daily":
+        return base
+    return [f"{column}|1W" for column in base]
+
+
+def kdj_from_stoch_values(
+    k: Any,
+    d: Any,
+    prev_k: Any = None,
+    prev_d: Any = None,
+) -> tuple[float, float | None] | None:
+    k_value = clean_float(k)
+    d_value = clean_float(d)
+    if k_value is None or d_value is None:
+        return None
+    prev_k_value = clean_float(prev_k)
+    prev_d_value = clean_float(prev_d)
+    j = 3 * k_value - 2 * d_value
+    prev_j = None
+    if prev_k_value is not None and prev_d_value is not None:
+        prev_j = 3 * prev_k_value - 2 * prev_d_value
+    return j, prev_j
+
+
+def _fetch_tradingview_kdj_exact(
+    market: str,
+    tickers: list[str],
+    timeframe: str,
+) -> tuple[dict[str, tuple[float, float | None]], list[str]]:
+    """Fetch exact TradingView K/D snapshots for one scanner market."""
+    endpoint = TRADINGVIEW_MARKET_ENDPOINTS.get(market)
+    if endpoint is None:
+        return {}, [f"TradingView KDJ endpoint unavailable for market: {market}"]
+    columns = tradingview_kdj_columns(timeframe)
+    values_by_symbol: dict[str, tuple[float, float | None]] = {}
+    errors: list[str] = []
+    for part in chunked(tickers, 80):
+        payload = {
+            "symbols": {"tickers": part, "query": {"types": []}},
+            "columns": columns,
+            "sort": {"sortBy": "name", "sortOrder": "asc"},
+            "options": {"lang": "zh"},
+            "range": [0, len(part)],
+        }
+        try:
+            response = post_json(endpoint, payload)
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+            errors.append(f"TradingView KDJ {market}: {type(exc).__name__}: {exc}")
+            continue
+        for item in response.get("data", []):
+            row = dict(zip(columns, item.get("d", [])))
+            values = kdj_from_stoch_values(*(row.get(column) for column in columns))
+            symbol = str(item.get("s") or "")
+            if symbol and values is not None:
+                values_by_symbol[symbol] = values
+    return values_by_symbol, errors
+
+
+def fetch_tradingview_kdj(
+    market: str,
+    tickers: list[str],
+    timeframe: str,
+) -> tuple[
+    dict[str, tuple[float, float | None]],
+    dict[str, str],
+    list[str],
+]:
+    """Fetch exact KDJ first, then try configured TradingView aliases."""
+    values_by_symbol, errors = _fetch_tradingview_kdj_exact(market, tickers, timeframe)
+    source_symbols = {symbol: symbol for symbol in values_by_symbol}
+    aliases_by_market: dict[str, list[tuple[str, str]]] = {}
+    for original_symbol in tickers:
+        if original_symbol in values_by_symbol:
+            continue
+        alias = TRADINGVIEW_KDJ_ALIASES.get(original_symbol)
+        if alias is None:
+            continue
+        alias_market, alias_symbol = alias
+        aliases_by_market.setdefault(alias_market, []).append((original_symbol, alias_symbol))
+
+    for alias_market, pairs in aliases_by_market.items():
+        alias_tickers = list(dict.fromkeys(alias_symbol for _, alias_symbol in pairs))
+        alias_values, alias_errors = _fetch_tradingview_kdj_exact(alias_market, alias_tickers, timeframe)
+        errors.extend(alias_errors)
+        for original_symbol, alias_symbol in pairs:
+            values = alias_values.get(alias_symbol)
+            if values is not None:
+                values_by_symbol[original_symbol] = values
+                source_symbols[original_symbol] = alias_symbol
+    return values_by_symbol, source_symbols, errors
+
+def apply_tradingview_kdj(
+    df: pd.DataFrame,
+    values: tuple[float, float | None] | None,
+    *,
+    required: bool = False,
+) -> pd.DataFrame:
+    """Replace local J with TradingView J; clear it when verification is required."""
+    out = df.copy()
+    if "J" not in out.columns or out.empty:
+        return out
+    if values is None:
+        if required:
+            out.loc[out.index[-1], "J"] = math.nan
+            if len(out) >= 2:
+                out.loc[out.index[-2], "J"] = math.nan
+        return out
+    j, prev_j = values
+    out.loc[out.index[-1], "J"] = j
+    if len(out) >= 2:
+        out.loc[out.index[-2], "J"] = math.nan if prev_j is None else prev_j
+    return out
 
 
 def clamp_score(value: float) -> int:
@@ -971,68 +1136,192 @@ def kdj_note(j: float | None, prev_j: float | None) -> tuple[str, bool]:
     return f"J{prev_j:.1f}->{j:.1f}", False
 
 
-def recent_macd_divergence(df: pd.DataFrame, pivot_left: int = 5, pivot_right: int = 5, min_bars: int = 5, max_bars: int = 80, recent_confirm_bars: int = 15) -> tuple[str, int]:
+def _macd_freshness_score(raw_score: int, age: int, timeframe: str) -> int:
+    """Apply the agreed daily/weekly signal-age decay to the MACD score."""
+    full_bars, half_bars = (1, 3) if timeframe == "weekly" else (3, 7)
+    if age <= full_bars:
+        return raw_score
+    if age <= half_bars:
+        return round(raw_score * 0.5)
+    return 0
+
+
+def recent_macd_divergence(
+    df: pd.DataFrame,
+    timeframe: str = "daily",
+    pivot_left: int = MACD_PIVOT_LEFT,
+    pivot_right: int = MACD_PIVOT_RIGHT,
+    min_bars: int = MACD_MIN_BARS,
+    max_bars: int = MACD_MAX_BARS,
+    confirmation_window: int = MACD_CONFIRMATION_WINDOW,
+) -> tuple[str, int]:
+    """Return the latest standard DIF divergence stage and its decayed score.
+
+    DIF pivots are the only divergence anchors. Histogram divergence merely
+    upgrades signal strength. A MACD cross or a price-structure break within
+    the confirmation window upgrades an identified signal to confirmed.
+    Hidden divergence is intentionally excluded from scoring.
+    """
     n = len(df)
+    required = {"high", "low", "close", "MACD_DIF", "MACD_DEA", "MACD_HIST"}
+    if n < pivot_left + pivot_right + 2 or not required.issubset(df.columns):
+        return "", 0
+
     high_pivots: list[int] = []
     low_pivots: list[int] = []
-    events: list[tuple[int, str, int]] = []
+    recognitions: dict[int, list[dict[str, Any]]] = {}
+    events: list[dict[str, Any]] = []
+
     for pivot in range(pivot_left, n - pivot_right):
         left = pivot - pivot_left
         right = pivot + pivot_right + 1
-        high = df["high"].iloc[pivot]
-        low = df["low"].iloc[pivot]
-        if pd.isna(high) or pd.isna(low):
+        dif = clean_float(df["MACD_DIF"].iloc[pivot])
+        if dif is None:
             continue
-        is_high = high >= df["high"].iloc[left:right].max()
-        is_low = low <= df["low"].iloc[left:right].min()
-        confirm = pivot + pivot_right
+        dif_window = pd.to_numeric(df["MACD_DIF"].iloc[left:right], errors="coerce")
+        if dif_window.isna().all():
+            continue
+        is_high = dif >= dif_window.max()
+        is_low = dif <= dif_window.min()
+        recognition = pivot + pivot_right
+
         if is_high:
             if high_pivots:
                 prev = high_pivots[-1]
                 distance = pivot - prev
-                if min_bars <= distance <= max_bars:
-                    curr_price = df["high"].iloc[pivot]
-                    prev_price = df["high"].iloc[prev]
-                    curr_dif = df["MACD_DIF"].iloc[pivot]
-                    prev_dif = df["MACD_DIF"].iloc[prev]
-                    curr_hist = df["MACD_HIST"].iloc[pivot]
-                    prev_hist = df["MACD_HIST"].iloc[prev]
-                    if curr_price > prev_price and (curr_dif < prev_dif or curr_hist < prev_hist):
-                        events.append((confirm, "MACD_BEAR_DIV", -8))
-                    elif curr_price < prev_price and (curr_dif > prev_dif or curr_hist > prev_hist):
-                        events.append((confirm, "MACD_HIDDEN_BEAR_DIV", -5))
+                curr_price = clean_float(df["high"].iloc[pivot])
+                prev_price = clean_float(df["high"].iloc[prev])
+                prev_dif = clean_float(df["MACD_DIF"].iloc[prev])
+                curr_hist = clean_float(df["MACD_HIST"].iloc[pivot])
+                prev_hist = clean_float(df["MACD_HIST"].iloc[prev])
+                if (
+                    min_bars <= distance <= max_bars
+                    and None not in (curr_price, prev_price, prev_dif, curr_hist, prev_hist)
+                    and curr_price > prev_price
+                    and dif < prev_dif
+                ):
+                    hist_left = clean_float(df["MACD_HIST"].iloc[pivot - 1])
+                    hist_right = clean_float(df["MACD_HIST"].iloc[pivot + 1])
+                    strong = (
+                        hist_left is not None
+                        and hist_right is not None
+                        and curr_hist < prev_hist
+                        and curr_hist >= hist_left
+                        and curr_hist >= hist_right
+                    )
+                    event = {
+                        "side": "BEAR",
+                        "strong": strong,
+                        "recognition": recognition,
+                        "break_level": clean_float(df["low"].iloc[pivot:recognition + 1].min()),
+                        "confirmed": None,
+                    }
+                    recognitions.setdefault(recognition, []).append(event)
+                    events.append(event)
             high_pivots.append(pivot)
+
         if is_low:
             if low_pivots:
                 prev = low_pivots[-1]
                 distance = pivot - prev
-                if min_bars <= distance <= max_bars:
-                    curr_price = df["low"].iloc[pivot]
-                    prev_price = df["low"].iloc[prev]
-                    curr_dif = df["MACD_DIF"].iloc[pivot]
-                    prev_dif = df["MACD_DIF"].iloc[prev]
-                    curr_hist = df["MACD_HIST"].iloc[pivot]
-                    prev_hist = df["MACD_HIST"].iloc[prev]
-                    if curr_price < prev_price and (curr_dif > prev_dif or curr_hist > prev_hist):
-                        events.append((confirm, "MACD_BULL_DIV", 12))
-                    elif curr_price > prev_price and (curr_dif < prev_dif or curr_hist < prev_hist):
-                        events.append((confirm, "MACD_HIDDEN_BULL_DIV", 6))
+                curr_price = clean_float(df["low"].iloc[pivot])
+                prev_price = clean_float(df["low"].iloc[prev])
+                prev_dif = clean_float(df["MACD_DIF"].iloc[prev])
+                curr_hist = clean_float(df["MACD_HIST"].iloc[pivot])
+                prev_hist = clean_float(df["MACD_HIST"].iloc[prev])
+                if (
+                    min_bars <= distance <= max_bars
+                    and None not in (curr_price, prev_price, prev_dif, curr_hist, prev_hist)
+                    and curr_price < prev_price
+                    and dif > prev_dif
+                ):
+                    hist_left = clean_float(df["MACD_HIST"].iloc[pivot - 1])
+                    hist_right = clean_float(df["MACD_HIST"].iloc[pivot + 1])
+                    strong = (
+                        hist_left is not None
+                        and hist_right is not None
+                        and curr_hist > prev_hist
+                        and curr_hist <= hist_left
+                        and curr_hist <= hist_right
+                    )
+                    event = {
+                        "side": "BULL",
+                        "strong": strong,
+                        "recognition": recognition,
+                        "break_level": clean_float(df["high"].iloc[pivot:recognition + 1].max()),
+                        "confirmed": None,
+                    }
+                    recognitions.setdefault(recognition, []).append(event)
+                    events.append(event)
             low_pivots.append(pivot)
+
+    pending: dict[str, dict[str, Any] | None] = {"BULL": None, "BEAR": None}
+    for idx in range(1, n):
+        for event in recognitions.get(idx, []):
+            pending[str(event["side"])] = event
+
+        dif = clean_float(df["MACD_DIF"].iloc[idx])
+        dea = clean_float(df["MACD_DEA"].iloc[idx])
+        prev_dif = clean_float(df["MACD_DIF"].iloc[idx - 1])
+        prev_dea = clean_float(df["MACD_DEA"].iloc[idx - 1])
+        close = clean_float(df["close"].iloc[idx])
+        bull_cross = None not in (dif, dea, prev_dif, prev_dea) and dif > dea and prev_dif <= prev_dea
+        bear_cross = None not in (dif, dea, prev_dif, prev_dea) and dif < dea and prev_dif >= prev_dea
+
+        for side, crossed in (("BULL", bull_cross), ("BEAR", bear_cross)):
+            event = pending[side]
+            if event is None:
+                continue
+            elapsed = idx - int(event["recognition"])
+            if elapsed > confirmation_window:
+                pending[side] = None
+                continue
+            break_level = clean_float(event.get("break_level"))
+            structure_break = (
+                close is not None
+                and break_level is not None
+                and (close > break_level if side == "BULL" else close < break_level)
+            )
+            if crossed or structure_break:
+                event["confirmed"] = idx
+                pending[side] = None
+
     if not events:
         return "", 0
-    recent = [(idx, note, score) for idx, note, score in events if n - 1 - idx <= recent_confirm_bars]
-    if not recent:
-        return "", 0
-    idx, note, score = recent[-1]
-    age = n - 1 - idx
-    return f"{note}@{age}bars", score
 
+    display_bars = 8 if timeframe == "weekly" else 15
+    recent_events: list[tuple[int, dict[str, Any]]] = []
+    for event in events:
+        signal_idx = int(event["confirmed"] if event["confirmed"] is not None else event["recognition"])
+        if n - 1 - signal_idx <= display_bars:
+            recent_events.append((signal_idx, event))
+    if not recent_events:
+        return "", 0
+
+    signal_idx, event = max(recent_events, key=lambda item: item[0])
+    age = n - 1 - signal_idx
+    side = str(event["side"])
+    strong = bool(event["strong"])
+    confirmed = event["confirmed"] is not None
+    expired = not confirmed and n - 1 - int(event["recognition"]) > confirmation_window
+    stage = "CONFIRMED" if confirmed else ("EXPIRED" if expired else "IDENTIFIED")
+    strength = "STRONG_" if strong else ""
+    note = f"MACD_DIF_{strength}{side}_{stage}@{age}bars"
+    magnitude = MACD_IDENTIFICATION_SCORE
+    if strong:
+        magnitude += MACD_RESONANCE_SCORE
+    if confirmed:
+        magnitude += MACD_CONFIRMATION_SCORE
+    raw_score = magnitude if side == "BULL" else -magnitude
+    return note, _macd_freshness_score(raw_score, age, timeframe)
 
 def weekly_j_lt_zero_candidate(
     tv_symbol: str,
     yahoo: str,
     market: str,
     df: pd.DataFrame,
+    source: str = "yfinance-local",
+    kdj_fallback: bool = False,
 ) -> Candidate | None:
     """Build the independent weekly J<0 candidate without requiring 120-week MAs."""
     if len(df) < 2:
@@ -1058,8 +1347,10 @@ def weekly_j_lt_zero_candidate(
     dif = clean_float(row.get("MACD_DIF"))
     dea = clean_float(row.get("MACD_DEA"))
     macd = None if dif is None or dea is None else ("DIF>=DEA" if dif >= dea else "DIF<DEA")
-    macd_div, _ = recent_macd_divergence(df)
-    total_kdj_weight = KDJ_MAX_BONUS + WEEKLY_J_LT_ZERO_EXTRA_BONUS
+    macd_div, macd_div_score = recent_macd_divergence(df, timeframe="weekly")
+    total_kdj_weight = KDJ_FALLBACK_MAX_BONUS if kdj_fallback else KDJ_MAX_BONUS + WEEKLY_J_LT_ZERO_EXTRA_BONUS
+    weight_label = "\u5907\u7528\u4f4e\u6743\u91cd" if kdj_fallback else "\u6b63\u5f0f\u9ad8\u6743\u91cd"
+    tags = ["J<0"] + (["KDJ_FALLBACK"] if kdj_fallback else [])
     return Candidate(
         symbol=tv_symbol,
         yahoo=yahoo,
@@ -1070,21 +1361,22 @@ def weekly_j_lt_zero_candidate(
         density=density,
         kind=WEEKLY_J_LT_ZERO,
         reason=(
-            f"\u5468\u7ebfKDJ J\u503c{j:.1f}<0\uff0cKDJ\u9ad8\u6743\u91cd +{total_kdj_weight}\u5206\uff1b"
+            f"\u5468\u7ebfKDJ J\u503c{j:.1f}<0\uff0c{weight_label} +{total_kdj_weight}\u5206\uff1b"
             "\u8be5\u540d\u5355\u4e0d\u8981\u6c42\u540c\u65f6\u6ee1\u8db3\u5747\u7ebf\u5bc6\u96c6\u6216\u56de\u8e29\u6761\u4ef6"
         ),
-        tags=["J<0"],
+        tags=tags,
         j=j,
         prev_j=prev_j,
         macd=macd,
         macd_divergence=macd_div,
-        score=clamp_score(50 + total_kdj_weight),
+        macd_divergence_score=macd_div_score,
+        kdj_weight_cap=total_kdj_weight,
+        score=clamp_score(50 + total_kdj_weight + macd_div_score),
         kdj_note=note,
-        source=str(df.attrs.get("source", "unknown")),
+        source=f"{df.attrs.get('source', 'unknown')}; KDJ={source}",
         bar_date=latest_bar_date(df),
         data_quality=str(df.attrs.get("data_quality", "OHLC validation passed")),
     )
-
 
 def classify_frame(
     tv_symbol: str,
@@ -1094,6 +1386,8 @@ def classify_frame(
     th: Thresholds,
     crypto_dense_only: bool = False,
     timeframe: str = "daily",
+    kdj_source: str = "yfinance-local",
+    kdj_fallback: bool = False,
 ) -> list[Candidate]:
     if len(df) < 130:
         return []
@@ -1125,7 +1419,7 @@ def classify_frame(
     prev_j = clean_float(prev["J"])
     note, j_hook = kdj_note(j, prev_j)
     macd = "DIF>=DEA" if clean_float(row["MACD_DIF"]) is not None and clean_float(row["MACD_DEA"]) is not None and row["MACD_DIF"] >= row["MACD_DEA"] else "DIF<DEA"
-    macd_div, macd_div_score = recent_macd_divergence(df)
+    macd_div, macd_div_score = recent_macd_divergence(df, timeframe=timeframe)
     change = None
     prev_close = clean_float(prev["close"])
     if prev_close:
@@ -1135,6 +1429,16 @@ def classify_frame(
         tags.append("J<0")
     elif j is not None and j < 20:
         tags.append("J<20")
+    if kdj_fallback:
+        tags.append("KDJ_FALLBACK")
+
+    kdj_base_max_bonus = KDJ_FALLBACK_MAX_BONUS if kdj_fallback else KDJ_MAX_BONUS
+    weekly_j_extra_bonus = (
+        WEEKLY_J_LT_ZERO_EXTRA_BONUS
+        if not kdj_fallback and timeframe == "weekly" and j is not None and j < 0
+        else 0
+    )
+    kdj_weight_cap = kdj_base_max_bonus + weekly_j_extra_bonus
 
     base = dict(
         symbol=tv_symbol,
@@ -1149,16 +1453,17 @@ def classify_frame(
         prev_j=prev_j,
         macd=macd,
         macd_divergence=macd_div,
-        source=str(df.attrs.get("source", "unknown")),
+        macd_divergence_score=macd_div_score,
+        kdj_weight_cap=kdj_weight_cap,
+        source=f"{df.attrs.get('source', 'unknown')}; KDJ={kdj_source}",
         bar_date=latest_bar_date(df),
         data_quality=str(df.attrs.get("data_quality", "OHLC validation passed")),
     )
     candidates: list[Candidate] = []
-    weekly_j_extra_bonus = WEEKLY_J_LT_ZERO_EXTRA_BONUS if timeframe == "weekly" and j is not None and j < 0 else 0
 
     above_20_group = close > max(ma20, ema20)
     if above_20_group and density <= th.dense_atr and width_pct <= th.dense_width_pct and price_dist <= th.dense_price_atr:
-        kdj_bonus = kdj_j_bonus(j) + weekly_j_extra_bonus
+        kdj_bonus = kdj_j_bonus(j, max_bonus=kdj_base_max_bonus) + weekly_j_extra_bonus
         score = clamp_score(100 - (density / th.dense_atr) * 45 - (price_dist / th.dense_price_atr) * 30 + kdj_bonus + (5 if change and change > 0 else 0) + macd_div_score)
         candidates.append(Candidate(
             kind=DENSE,
@@ -1196,8 +1501,8 @@ def classify_frame(
         close_distance_atr = zone_distance(close, group_low, group_high) / atr
         low_distance_atr = zone_distance(low, group_low, group_high) / atr
         score = 44 + 15 + max(0, 10 - close_distance_atr * 12)
-        score += kdj_j_bonus(j) + weekly_j_extra_bonus
-        if j_hook:
+        score += kdj_j_bonus(j, max_bonus=kdj_base_max_bonus) + weekly_j_extra_bonus
+        if j_hook and not kdj_fallback:
             score += 15
         if change and change > 0:
             score += 3
@@ -1260,6 +1565,8 @@ def scan(
         sections[WEEKLY_J_LT_ZERO] = []
     tasks: list[tuple[str, str, str]] = []
     for market, tickers in symbols.items():
+        tradingview_kdj, tradingview_kdj_sources, tradingview_errors = fetch_tradingview_kdj(market, tickers, timeframe)
+        errors.extend(tradingview_errors)
         for tv_symbol in tickers:
             exact_source = has_exact_source(tv_symbol)
             if not allow_approximate_mappings and tv_symbol in APPROXIMATE_MAPPINGS and not exact_source:
@@ -1292,12 +1599,65 @@ def scan(
                 if df.empty:
                     raise ValueError("empty OHLCV")
                 ind = add_indicators(df)
+                formal_ind = ind.copy()
+                formal_j = clean_float(formal_ind.iloc[-1].get("J"))
+                verified_kdj = tradingview_kdj.get(tv_symbol)
+                source_symbol = tradingview_kdj_sources.get(tv_symbol)
+                kdj_fallback = verified_kdj is None or source_symbol != tv_symbol
+                if verified_kdj is not None:
+                    ind = apply_tradingview_kdj(ind, verified_kdj)
+                    if source_symbol == tv_symbol:
+                        kdj_source = f"tradingview-kdj:{tv_symbol}"
+                    else:
+                        kdj_source = f"tradingview-kdj-fallback:{source_symbol}"
+                        if timeframe == "weekly":
+                            errors.append(
+                                f"KDJ备用：{tv_symbol} 使用 TradingView 同标的代码 {source_symbol}，"
+                                f"KDJ权重上限 +{KDJ_FALLBACK_MAX_BONUS} 分"
+                            )
+                else:
+                    kdj_source = "yfinance-local-kdj-fallback"
+                    local_j = clean_float(ind.iloc[-1].get("J"))
+                    if timeframe == "weekly" and local_j is None:
+                        if local_j is not None:
+                            errors.append(
+                                f"KDJ备用：{tv_symbol} 使用 Yahoo 本地周线KDJ，"
+                                f"KDJ权重上限 +{KDJ_FALLBACK_MAX_BONUS} 分"
+                            )
+                        else:
+                            errors.append(
+                                f"KDJ不足：{tv_symbol} 的 TradingView 与 Yahoo 周线KDJ均不可用，"
+                                "本期不计KDJ分"
+                            )
+                if formal_j is not None:
+                    ind = formal_ind
+                    kdj_source = "custom-rma-local"
+                    kdj_fallback = False
+                elif verified_kdj is not None:
+                    kdj_fallback = True
                 rows_count += 1
                 if timeframe == "weekly":
-                    weekly_candidate = weekly_j_lt_zero_candidate(tv_symbol, provider_symbol, market, ind)
+                    weekly_candidate = weekly_j_lt_zero_candidate(
+                        tv_symbol,
+                        provider_symbol,
+                        market,
+                        ind,
+                        source=kdj_source,
+                        kdj_fallback=kdj_fallback,
+                    )
                     if weekly_candidate is not None:
                         sections[WEEKLY_J_LT_ZERO].append(weekly_candidate)
-                for cand in classify_frame(tv_symbol, provider_symbol, market, ind, th, crypto_dense_only, timeframe):
+                for cand in classify_frame(
+                    tv_symbol,
+                    provider_symbol,
+                    market,
+                    ind,
+                    th,
+                    crypto_dense_only=crypto_dense_only,
+                    timeframe=timeframe,
+                    kdj_source=kdj_source,
+                    kdj_fallback=kdj_fallback,
+                ):
                     sections.setdefault(cand.kind, []).append(cand)
             except Exception as exc:
                 missing.append(tv_symbol)
@@ -1312,7 +1672,7 @@ def scan(
             sections[key] = sorted(sections[key], key=lambda c: c.sort_tuple())[:th.max_items_per_section]
     return {
         "timeframe": timeframe,
-        "source": "Equities/indices: Yahoo repaired; SSE ETFs: qfq/split-adjusted + Sina close; crypto: exact-venue official APIs",
+        "source": "Equities/indices: Yahoo repaired; SSE ETFs: qfq/split-adjusted + Sina close; crypto: exact-venue official APIs; KDJ: custom RMA local primary, TradingView marked capped fallback only",
         "formula_version": FORMULA_VERSION,
         "indicator_spec": INDICATOR_SPEC,
         "bar_policy": "confirmed bars only",
@@ -1343,6 +1703,8 @@ def candidate_to_dict(c: Candidate) -> dict[str, Any]:
         "prev_j": c.prev_j,
         "macd": c.macd,
         "macd_divergence": c.macd_divergence,
+        "macd_divergence_score": c.macd_divergence_score,
+        "kdj_weight_cap": c.kdj_weight_cap,
         "score": c.score,
         "kdj_note": c.kdj_note,
         "fresh_pullback": c.fresh_pullback,
@@ -1457,15 +1819,50 @@ def self_test() -> None:
     validate_ohlcv(corrupt, allow_extreme_wicks=True)
 
     weekly_test = ind.copy()
-    weekly_test.loc[weekly_test.index[-2], "J"] = -8.0
-    weekly_test.loc[weekly_test.index[-1], "J"] = -5.0
-    weekly_candidate = weekly_j_lt_zero_candidate("NASDAQ:TEST", "TEST", "america", weekly_test)
+    weekly_test.loc[weekly_test.index[-2], "J"] = -16.2
+    weekly_test.loc[weekly_test.index[-1], "J"] = -22.5
+    tradingview_positive = apply_tradingview_kdj(weekly_test, (24.1, 30.0), required=True)
+    assert weekly_j_lt_zero_candidate("SSE:561980", "561980.SS", "china", tradingview_positive) is None
+    tradingview_missing = apply_tradingview_kdj(weekly_test, None, required=True)
+    assert weekly_j_lt_zero_candidate("SSE:561980", "561980.SS", "china", tradingview_missing) is None
+    tradingview_negative = apply_tradingview_kdj(weekly_test, (-5.0, -8.0), required=True)
+    weekly_candidate = weekly_j_lt_zero_candidate("NASDAQ:TEST", "TEST", "america", tradingview_negative)
     assert weekly_candidate is not None and weekly_candidate.kind == WEEKLY_J_LT_ZERO
     assert weekly_candidate.score == 100
     assert weekly_candidate.bar_status == "confirmed"
     assert weekly_candidate.bar_date == dates[-1].date().isoformat()
+    fallback_candidate = weekly_j_lt_zero_candidate(
+        "NASDAQ:TEST",
+        "TEST",
+        "america",
+        tradingview_negative,
+        source="yfinance-local-kdj-fallback",
+        kdj_fallback=True,
+    )
+    assert fallback_candidate is not None and fallback_candidate.score == 65
+    assert fallback_candidate.kdj_weight_cap == KDJ_FALLBACK_MAX_BONUS
+    assert "KDJ_FALLBACK" in fallback_candidate.tags
+    assert kdj_from_stoch_values(57.2946126279, 73.8948034240) is not None
     assert kdj_j_bonus(-1.0) == KDJ_MAX_BONUS
     assert KDJ_MAX_BONUS + WEEKLY_J_LT_ZERO_EXTRA_BONUS == 50
+    dif_values = [0.0, 0.4, 0.8, 0.4, 0.0, -0.4, -0.8, -1.2, -1.7, -1.9, -2.2, -1.8, -1.2, -0.5, 0.0, -0.4, -0.8, -1.1, -1.4, -1.3, -1.6, -1.2, -0.8, -0.2, 0.2]
+    divergence_test = pd.DataFrame({
+        "high": [101.0] * len(dif_values),
+        "low": [99.0] * len(dif_values),
+        "close": [100.0] * len(dif_values),
+        "MACD_DIF": dif_values,
+        "MACD_DEA": [value + 0.2 for value in dif_values],
+        "MACD_HIST": [0.0] * len(dif_values),
+    })
+    divergence_test.loc[10, "low"] = 90.0
+    divergence_test.loc[20, "low"] = 80.0
+    divergence_test.loc[10, "MACD_HIST"] = -1.0
+    divergence_test.loc[20, "MACD_HIST"] = -0.5
+    divergence_test.loc[23, "MACD_DEA"] = dif_values[23] - 0.2
+    divergence_test.loc[24, "MACD_DEA"] = dif_values[24] - 0.2
+    div_note, div_score = recent_macd_divergence(divergence_test, timeframe="daily")
+    assert div_note == "MACD_DIF_STRONG_BULL_CONFIRMED@1bars"
+    assert div_score == MACD_MAX_SCORE
     print("self-test passed")
 
 

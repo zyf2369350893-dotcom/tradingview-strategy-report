@@ -17,7 +17,9 @@ from market_scan_local import (
     DENSE,
     FORMULA_VERSION,
     INDICATOR_SPEC,
+    KDJ_FALLBACK_MAX_BONUS,
     KDJ_MAX_BONUS,
+    MACD_MAX_SCORE,
     PULL20,
     PULL60,
     WEEKLY_J_LT_ZERO,
@@ -44,15 +46,19 @@ MACD_LABELS = {
 }
 
 DIV_LABELS = {
-    "MACD_BULL_DIV": "MACD底背离",
-    "MACD_HIDDEN_BULL_DIV": "MACD隐藏底背离",
-    "DIF_BULL_DIV": "DIF底背离",
-    "HIST_BULL_DIV": "柱体底背离",
-    "MACD_BEAR_DIV": "MACD顶背离压力",
-    "DIF_BEAR_DIV": "DIF顶背离压力",
-    "HIST_BEAR_DIV": "柱体顶背离压力",
+    "MACD_DIF_BULL_IDENTIFIED": "DIF底背识别，等待确认",
+    "MACD_DIF_STRONG_BULL_IDENTIFIED": "强底背识别（柱体共振），等待确认",
+    "MACD_DIF_BULL_CONFIRMED": "DIF底背正式确认",
+    "MACD_DIF_STRONG_BULL_CONFIRMED": "强底背正式确认（柱体共振）",
+    "MACD_DIF_BULL_EXPIRED": "DIF底背识别，确认窗口已过",
+    "MACD_DIF_STRONG_BULL_EXPIRED": "强底背识别（柱体共振），确认窗口已过",
+    "MACD_DIF_BEAR_IDENTIFIED": "DIF顶背识别，等待确认",
+    "MACD_DIF_STRONG_BEAR_IDENTIFIED": "强顶背识别（柱体共振），等待确认",
+    "MACD_DIF_BEAR_CONFIRMED": "DIF顶背正式确认",
+    "MACD_DIF_STRONG_BEAR_CONFIRMED": "强顶背正式确认（柱体共振）",
+    "MACD_DIF_BEAR_EXPIRED": "DIF顶背识别，确认窗口已过",
+    "MACD_DIF_STRONG_BEAR_EXPIRED": "强顶背识别（柱体共振），确认窗口已过",
 }
-
 KDJ_NOTE_LABELS = {
     "KDJ no data": "KDJ数据不足",
     "J<0": "J<0 极度低位",
@@ -127,7 +133,42 @@ def zh_divergence(divergence: object) -> str:
         return DIV_LABELS.get(text, text)
     key, bars = match.groups()
     label = DIV_LABELS.get(key, key)
-    return f"{label}（{bars}根K线前确认）"
+    if key.endswith("_CONFIRMED"):
+        return f"{label}（{bars}根K线前确认）"
+    return f"{label}（{bars}根K线前识别）"
+
+
+def fmt_macd_score(value: object) -> str:
+    try:
+        return f"{int(value):+d}分"
+    except (TypeError, ValueError):
+        return "0分"
+
+
+def zh_kdj_source(source: object) -> str:
+    text = str(source or "").strip()
+    if "KDJ=" in text:
+        text = text.rsplit("KDJ=", 1)[1].strip()
+    if text == "custom-rma-local":
+        return "\u672c\u5730\u81ea\u5b9a\u4e49KDJ\uff08\u6b63\u5f0f\uff09"
+    if text.startswith("tradingview-kdj:"):
+        return f"TradingView KDJ\uff08\u5907\u7528\uff0c{text.split(':', 1)[1]}\uff09"
+    if text.startswith("tradingview-kdj-fallback:"):
+        return f"TradingView备用同标的（{text.split(':', 1)[1]}）"
+    if text.startswith("tradingview-kdj:"):
+        return f"TradingView正式KDJ（{text.split(':', 1)[1]}）"
+    if text == "yfinance-local-kdj-fallback":
+        return "Yahoo本地KDJ（备用）"
+    if "tradingview-kdj" in text:
+        return "TradingView正式KDJ"
+    return text or "-"
+
+
+def fmt_kdj_weight_cap(value: object) -> str:
+    try:
+        return f"+{int(value)}分"
+    except (TypeError, ValueError):
+        return "-"
 
 
 def zh_reason(reason: object) -> str:
@@ -185,12 +226,14 @@ def weekly_j_lt_zero_rows(
         if symbol and symbol not in unique:
             unique[symbol] = row
 
-    def sort_key(row: dict[str, object]) -> tuple[float, str]:
+    def sort_key(row: dict[str, object]) -> tuple[int, float, str]:
+        source = str(row.get("source") or "")
+        fallback_rank = 1 if "fallback" in source else 0
         try:
             j_value = float(row.get("j"))
         except (TypeError, ValueError):
             j_value = float("inf")
-        return (j_value, str(row.get("symbol") or ""))
+        return (fallback_rank, j_value, str(row.get("symbol") or ""))
 
     return sorted(unique.values(), key=sort_key)[:max_items]
 
@@ -218,7 +261,8 @@ def plain_candidates(title: str, rows: list[dict[str, object]]) -> list[str]:
             f"{idx}. {row.get('symbol')}｜{zh_kind(row.get('kind'))}｜评分 {row.get('score')}",
             f"收盘 {fmt_float(row.get('close'))}｜涨跌 {fmt_pct(row.get('change'))}｜J {fmt_float(row.get('j'), 1)}",
             f"KDJ：{zh_kdj_note(row.get('kdj_note'))}",
-            f"MACD：{zh_macd(row.get('macd'))}；{zh_divergence(row.get('macd_divergence'))}",
+            f"KDJ数据：{zh_kdj_source(row.get('source'))}；权重上限 {fmt_kdj_weight_cap(row.get('kdj_weight_cap'))}",
+            f"MACD：{zh_macd(row.get('macd'))}；{zh_divergence(row.get('macd_divergence'))}；计分 {fmt_macd_score(row.get('macd_divergence_score'))}",
             f"原因：{zh_reason(row.get('reason'))}",
         ]
         parts.insert(-1, f"K\u7ebf\u65e5\u671f\uff1a{row.get('bar_date') or '-'}\uff5c\u72b6\u6001\uff1a\u5df2\u6536\u76d8\u786e\u8ba4")
@@ -238,8 +282,11 @@ def card_html(row: dict[str, object], idx: int) -> str:
     change = esc(fmt_pct(row.get("change")))
     j_value = esc(fmt_float(row.get("j"), 1))
     kdj = esc(zh_kdj_note(row.get("kdj_note")))
+    kdj_source = esc(zh_kdj_source(row.get("source")))
+    kdj_weight_cap = esc(fmt_kdj_weight_cap(row.get("kdj_weight_cap")))
     macd = esc(zh_macd(row.get("macd")))
     div = esc(zh_divergence(row.get("macd_divergence")))
+    macd_score = esc(fmt_macd_score(row.get("macd_divergence_score")))
     reason = esc(zh_reason(row.get("reason")))
     bar_date = esc(row.get("bar_date") or "-")
     source = esc(row.get("source") or "-")
@@ -275,8 +322,12 @@ def card_html(row: dict[str, object], idx: int) -> str:
             <td style="padding:5px 0;text-align:right;font-weight:700;color:#111827;">{j_value}</td>
           </tr>
           <tr>
+            <td style="padding:5px 0;color:#6b7280;">KDJ数据</td>
+            <td style="padding:5px 0;text-align:right;color:#111827;">{kdj_source}；权重上限 {kdj_weight_cap}</td>
+          </tr>
+          <tr>
             <td style="padding:5px 0;color:#6b7280;">MACD辅助</td>
-            <td style="padding:5px 0;text-align:right;color:#111827;">{macd}；{div}</td>
+            <td style="padding:5px 0;text-align:right;color:#111827;">{macd}；{div}；计分 {macd_score}</td>
           </tr>
           <tr>
             <td style="padding:5px 0;color:#6b7280;">K\u7ebf\u65e5\u671f</td>
@@ -320,15 +371,78 @@ def section_html(title: str, result: dict[str, object], rows: list[dict[str, obj
 
 def weekly_priority_html(rows: list[dict[str, object]]) -> str:
     total_weight = KDJ_MAX_BONUS + WEEKLY_J_LT_ZERO_EXTRA_BONUS
-    return f"""
+    html_text = f"""
       <section style="margin-top:22px;background:#fffbeb;border:2px solid #f59e0b;border-radius:10px;padding:14px;">
-        <h2 style="font-size:18px;margin:0 0 8px;color:#92400e;">周线 KDJ J&lt;0 高权重关注</h2>
+        <h2 style="font-size:18px;margin:0 0 8px;color:#92400e;">周线 KDJ J&lt;0 关注（正式优先）</h2>
         <div style="font-size:13px;color:#92400e;line-height:1.55;margin-bottom:10px;">
-          独立筛选全股票池，KDJ总权重 +{total_weight} 分，按J值从低到高排列；可能与下方常规候选重复。
+          TradingView正式KDJ最高 +{total_weight} 分；备用KDJ最高 +{KDJ_FALLBACK_MAX_BONUS} 分。正式数据优先，再按J值从低到高排列；可能与下方常规候选重复。
         </div>
         {cards_html(rows)}
       </section>
     """
+    old_description = f"TradingView\u6b63\u5f0fKDJ\u6700\u9ad8 +{total_weight} \u5206\uff1b\u5907\u7528KDJ\u6700\u9ad8 +{KDJ_FALLBACK_MAX_BONUS} \u5206\u3002\u6b63\u5f0f\u6570\u636e\u4f18\u5148\uff0c\u518d\u6309J\u503c\u4ece\u4f4e\u5230\u9ad8\u6392\u5217\uff1b\u53ef\u80fd\u4e0e\u4e0b\u65b9\u5e38\u89c4\u5019\u9009\u91cd\u590d\u3002"
+    new_description = (
+        f"\u672c\u5730\u81ea\u5b9a\u4e49KDJ\u6b63\u5f0f\u503c\u6700\u9ad8 +{total_weight} \u5206\uff1b"
+        f"TradingView\u5907\u7528KDJ\u6700\u9ad8 +{KDJ_FALLBACK_MAX_BONUS} \u5206\u3002"
+        "\u6b63\u5f0f\u503c\u4f18\u5148\uff0c\u518d\u6309J\u503c\u4ece\u4f4e\u5230\u9ad8\u6392\u5217\uff1b\u53ef\u80fd\u4e0e\u4e0b\u65b9\u5e38\u89c4\u5019\u9009\u91cd\u590d\u3002"
+    )
+    return html_text.replace(old_description, new_description)
+
+
+
+def build_fix_notice() -> tuple[str, str, str]:
+    now = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
+    subject = f"【已修复】561980周线KDJ J值差异说明｜{now} 北京时间"
+    plain_body = f"""561980 周线 KDJ J 值问题已修复
+
+结论：策略的 J<0 加权逻辑没有问题，问题出在原先使用的行情数据口径。
+
+复现结果：
+- 原程序用 Yahoo Finance 周K线本地重算，得到 J=-22.5。
+- TradingView 上一根已收盘周线得到 J=24.1，与图表上约 25 的显示一致。
+- Yahoo 的 561980.SS 数据在 2026-06-25 出现最高价 4.192，而相邻交易日价格约为 0.8；该异常价被合并进周K后，扭曲了9周高低区间，导致 J 值被误算为负数。
+
+修复内容：
+1. 均线、ATR、MACD仍使用完整K线计算。
+2. KDJ 的 J 值及前一周期 J 值改为以 TradingView 快照为准。
+3. 周线只有在 TradingView 明确确认 J<0 时才触发 +50 权重；取值失败时跳过权重，避免误报。
+
+验证结果：561980 已不再进入“周线J<0”名单，回归测试通过。
+
+生成时间：{now} 北京时间
+风险提醒：本邮件仅说明技术筛选系统修复结果，不构成买卖建议。"""
+    html_body = f"""<!doctype html>
+<html>
+  <body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,'Microsoft YaHei',sans-serif;color:#111827;">
+    <div style="max-width:680px;margin:0 auto;padding:18px 12px;">
+      <div style="background:#065f46;color:#fff;border-radius:10px;padding:18px 16px;">
+        <div style="font-size:13px;opacity:.82;">{esc(now)} 北京时间</div>
+        <h1 style="font-size:22px;line-height:1.3;margin:6px 0 0;">561980 周线 KDJ 问题已修复</h1>
+      </div>
+      <div style="background:#fff;border:1px solid #e5e7eb;border-radius:10px;margin-top:12px;padding:16px;line-height:1.7;font-size:14px;">
+        <p><strong>结论：</strong>J&lt;0 加权逻辑没有问题，错误来自原行情数据口径。</p>
+        <h2 style="font-size:17px;">原因</h2>
+        <ul>
+          <li>原程序用 Yahoo Finance 周K线本地重算，得到 <strong>J=-22.5</strong>。</li>
+          <li>TradingView 上一根已收盘周线为 <strong>J=24.1</strong>，与图表约 25 的显示一致。</li>
+          <li>Yahoo 的 561980.SS 在 2026-06-25 出现最高价 4.192，而相邻交易日约为 0.8。异常价进入周K后扭曲9周高低区间，造成负值误报。</li>
+        </ul>
+        <h2 style="font-size:17px;">已完成的修复</h2>
+        <ol>
+          <li>均线、ATR、MACD继续使用完整K线计算。</li>
+          <li>KDJ 的 J 值和前值改为以 TradingView 快照为准。</li>
+          <li>只有 TradingView 明确确认 J&lt;0 才触发 +50 权重；取值失败时跳过，防止误报。</li>
+        </ol>
+        <p><strong>验证：</strong>561980 已不再进入“周线J&lt;0”名单，回归测试通过。</p>
+      </div>
+      <div style="margin-top:12px;background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:13px 15px;color:#9a3412;font-size:13px;line-height:1.6;">
+        本邮件仅说明技术筛选系统修复结果，不构成买卖建议。
+      </div>
+    </div>
+  </body>
+</html>"""
+    return subject, plain_body, html_body
+
 
 def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
     timeframe = "weekly" if report_type == "weekly" else "daily"
@@ -347,24 +461,31 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
 
     if report_type == "weekly":
         priority_lines = [
-            f"1. 周线J<0：独立筛选全股票池，KDJ总权重 +{total_weekly_kdj_weight} 分，并在邮件置顶单列。",
+            f"1. 周线J<0：TradingView正式KDJ最高 +{total_weekly_kdj_weight} 分；无数据时自动备用且最高 +{KDJ_FALLBACK_MAX_BONUS} 分，正式数据优先置顶。",
             "2. 自选列表：均线密集需同时满足 ATR 压缩和六线跨度占比，且J值越小越加分。",
             "3. 回踩20周与60周均线并列，J值越小权重越高。",
-            "4. MACD背离仅作为辅助评分，不做硬筛选。",
+            f"4. MACD约占15%辅助权重，最高±{MACD_MAX_SCORE}分：DIF识别±4、柱体共振再±3、正式确认再±5；1周内全分，2至3周半分，超过3周只显示不计分。",
             "5. 加密列表的常规候选目前只看均线密集；周线J<0仍会进入置顶名单。",
         ]
     else:
         priority_lines = [
             f"1. 自选列表：均线密集需同时满足 ATR 压缩和六线跨度占比；J<20按深度加分，J<0时KDJ最高 +{KDJ_MAX_BONUS} 分。",
             "2. 回踩20日与60日均线并列；J值权重同上，若J值向上勾头再加15分。",
-            "3. MACD背离仅作为辅助评分，不做硬筛选。",
+            f"3. MACD约占15%辅助权重，最高±{MACD_MAX_SCORE}分：DIF识别±4、柱体共振再±3、正式确认再±5；3日内全分，4至7日半分，超过7日只显示不计分。",
             "4. 加密列表：目前只看均线密集；密集后J<0作为加分项。",
         ]
+
+    if report_type == "weekly":
+        priority_lines[0] = (
+            f"1. \u5468\u7ebfJ<0\uff1a\u62c6\u5206/\u590d\u6743\u6821\u6b63\u540e\u7684\u81ea\u5b9a\u4e49KDJ\u4e3a\u6b63\u5f0f\u503c\uff0c\u6700\u9ad8 +{total_weekly_kdj_weight} \u5206\uff1b"
+            f"\u7f3a\u6570\u65f6\u4f7f\u7528TradingView\u5907\u7528\u4e14\u6700\u9ad8 +{KDJ_FALLBACK_MAX_BONUS} \u5206\uff0c\u6b63\u5f0f\u503c\u4f18\u5148\u7f6e\u9876\u3002"
+        )
 
     precision_header = [
         f"\u7cbe\u5ea6\u7248\u672c\uff1a{FORMULA_VERSION}",
         f"\u6307\u6807\u516c\u5f0f\uff1a{INDICATOR_SPEC}",
         "\u53ea\u4f7f\u7528\u5df2\u6536\u76d8K\u7ebf\uff1b\u666e\u901a\u80a1\u7968/\u6307\u6570Yahoo repair=True\uff1bA\u80a1ETF\u524d\u590d\u6743/\u62c6\u5206\u6821\u6b63+\u65b0\u6d6a\u6536\u76d8\u8865\u9f50\uff1b\u52a0\u5bc6\u8d27\u5e01\u6307\u5b9a\u4ea4\u6613\u6240\u5b98\u65b9API\uff1b\u5f02\u5e38OHLC\u4e0d\u53c2\u4e0e\u7b5b\u9009",
+        "KDJ\u4f7f\u7528\u62c6\u5206/\u590d\u6743\u6821\u6b63\u540e\u7684\u5df2\u6536\u76d8K\u7ebf\u6309\u81ea\u5b9a\u4e49RMA\u516c\u5f0f\u91cd\u7b97\uff1bTradingView\u4ec5\u4f5c\u7f3a\u6570\u5907\u7528\uff0c\u6700\u9ad8 +15 \u5206",
         "\u8bc4\u5206\u662f\u7b56\u7565\u6392\u5e8f\uff0c\u4e0d\u662f\u884c\u60c5\u6570\u636e\u7cbe\u5ea6",
     ]
     plain_lines = [*precision_header,
@@ -380,7 +501,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
     ]
     if report_type == "weekly":
         plain_lines.extend(plain_candidates(
-            f"周线 KDJ J<0 高权重关注（KDJ总权重 +{total_weekly_kdj_weight}，按J值从低到高）",
+            f"周线 KDJ J<0 关注（正式最高 +{total_weekly_kdj_weight}，备用最高 +{KDJ_FALLBACK_MAX_BONUS}，正式优先）",
             weekly_priority_rows,
         ))
     plain_lines.extend(plain_candidates("自选列表候选", watch_rows))
@@ -447,6 +568,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
       </div>
       <div style="margin:12px 2px 0;color:#6b7280;font-size:12px;line-height:1.5;">
         \u6570\u636e\u6e90\uff1a\u666e\u901a\u80a1\u7968/\u6307\u6570Yahoo\u4fee\u590dK\u7ebf\uff1bA\u80a1ETF\u524d\u590d\u6743/\u62c6\u5206\u6821\u6b63+\u65b0\u6d6a\u6536\u76d8\u8865\u9f50\uff1b\u52a0\u5bc6\u8d27\u5e01\u7b26\u53f7\u5bf9\u5e94\u4ea4\u6613\u6240\u5b98\u65b9API\uff1b\u6307\u6807\u672c\u5730\u91cd\u7b97\u3002
+        <br>KDJ\u6b63\u5f0f\u503c\u7531\u6821\u6b63\u540e\u7684\u5df2\u6536\u76d8K\u7ebf\u6309\u81ea\u5b9a\u4e49RMA\u516c\u5f0f\u91cd\u7b97\uff1bTradingView\u4ec5\u4f5c\u7f3a\u6570\u5907\u7528\uff08\u6700\u9ad8 +15 \u5206\uff09\u3002
       </div>
     </div>
   </body>
@@ -503,7 +625,7 @@ def send_email(subject: str, plain_body: str, html_body: str, dry_run: bool = Fa
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate and email strategy report.")
-    parser.add_argument("--report-type", choices=["daily", "weekly"], default="daily")
+    parser.add_argument("--report-type", choices=["daily", "weekly", "diagnostic"], default="daily")
     parser.add_argument("--max-items", type=int, default=30)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
@@ -511,7 +633,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    subject, plain_body, html_body = build_report(args.report_type, args.max_items)
+    if args.report_type == "diagnostic":
+        subject, plain_body, html_body = build_fix_notice()
+    else:
+        subject, plain_body, html_body = build_report(args.report_type, args.max_items)
     send_email(subject, plain_body, html_body, dry_run=args.dry_run)
     return 0
 

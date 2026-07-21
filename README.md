@@ -9,6 +9,7 @@ Automated daily and weekly TradingView strategy reports.
 - Regular equities/indices use repaired Yahoo data; SSE ETFs use qfq/split-adjusted history plus the latest completed Sina close quote.
 - Crypto uses the official public API of the exact TradingView exchange prefix.
 - Cross-venue proxy mappings are excluded from strict reports.
+- KDJ scoring uses the custom RMA formula recalculated from validated OHLC; TradingView is a marked fallback only and is capped at 15 points.
 - Each candidate includes its bar date, source, and quality status.
 - Default recipient: zyf18236610022@qq.com.
 
