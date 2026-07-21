@@ -364,14 +364,14 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
     precision_header = [
         f"\u7cbe\u5ea6\u7248\u672c\uff1a{FORMULA_VERSION}",
         f"\u6307\u6807\u516c\u5f0f\uff1a{INDICATOR_SPEC}",
-        "\u53ea\u4f7f\u7528\u5df2\u6536\u76d8K\u7ebf\uff1b\u666e\u901a\u80a1\u7968/\u6307\u6570Yahoo repair=True\uff1bA\u80a1ETF\u4e1c\u65b9\u8d22\u5bcc/\u65b0\u6d6a\uff1b\u52a0\u5bc6\u8d27\u5e01\u6307\u5b9a\u4ea4\u6613\u6240\u5b98\u65b9API\uff1b\u5f02\u5e38OHLC\u4e0d\u53c2\u4e0e\u7b5b\u9009",
+        "\u53ea\u4f7f\u7528\u5df2\u6536\u76d8K\u7ebf\uff1b\u666e\u901a\u80a1\u7968/\u6307\u6570Yahoo repair=True\uff1bA\u80a1ETF\u524d\u590d\u6743/\u62c6\u5206\u6821\u6b63+\u65b0\u6d6a\u6536\u76d8\u8865\u9f50\uff1b\u52a0\u5bc6\u8d27\u5e01\u6307\u5b9a\u4ea4\u6613\u6240\u5b98\u65b9API\uff1b\u5f02\u5e38OHLC\u4e0d\u53c2\u4e0e\u7b5b\u9009",
         "\u8bc4\u5206\u662f\u7b56\u7565\u6392\u5e8f\uff0c\u4e0d\u662f\u884c\u60c5\u6570\u636e\u7cbe\u5ea6",
     ]
     plain_lines = [*precision_header,
         f"TradingView策略{report_name}",
         f"生成时间：{now} 北京时间",
         f"周期：{timeframe_name}",
-        "\u6570\u636e\u6e90\uff1a\u666e\u901a\u80a1\u7968/\u6307\u6570Yahoo\u4fee\u590dK\u7ebf\uff1bA\u80a1ETF\u4e1c\u65b9\u8d22\u5bcc/\u65b0\u6d6a\uff1b\u52a0\u5bc6\u8d27\u5e01\u7b26\u53f7\u5bf9\u5e94\u4ea4\u6613\u6240\u5b98\u65b9API\uff1b\u6307\u6807\u672c\u5730\u91cd\u7b97",
+        "\u6570\u636e\u6e90\uff1a\u666e\u901a\u80a1\u7968/\u6307\u6570Yahoo\u4fee\u590dK\u7ebf\uff1bA\u80a1ETF\u524d\u590d\u6743/\u62c6\u5206\u6821\u6b63+\u65b0\u6d6a\u6536\u76d8\u8865\u9f50\uff1b\u52a0\u5bc6\u8d27\u5e01\u7b26\u53f7\u5bf9\u5e94\u4ea4\u6613\u6240\u5b98\u65b9API\uff1b\u6307\u6807\u672c\u5730\u91cd\u7b97",
         "",
         "筛选优先级：",
         *priority_lines,
@@ -418,7 +418,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
     priority_html_items = "".join(f"<li>{esc(item[3:])}</li>" for item in priority_lines)
     weekly_priority_section = weekly_priority_html(weekly_priority_rows) if report_type == "weekly" else ""
 
-    precision_html = f'<div style="background:#ecfdf3;border:1px solid #abefc6;border-radius:10px;margin-top:12px;padding:12px 16px;color:#05603a;font-size:13px;line-height:1.6;"><strong>\u7cbe\u5ea6\u7248\u672c {FORMULA_VERSION}</strong><br>{esc(INDICATOR_SPEC)}<br>\u4ec5\u5df2\u6536\u76d8K\u7ebf\uff5c\u666e\u901a\u80a1\u7968/\u6307\u6570Yahoo repair=True\uff5cA\u80a1ETF\u4e1c\u65b9\u8d22\u5bcc/\u65b0\u6d6a\uff5c\u52a0\u5bc6\u8d27\u5e01\u6307\u5b9a\u4ea4\u6613\u6240\u5b98\u65b9API</div>'
+    precision_html = f'<div style="background:#ecfdf3;border:1px solid #abefc6;border-radius:10px;margin-top:12px;padding:12px 16px;color:#05603a;font-size:13px;line-height:1.6;"><strong>\u7cbe\u5ea6\u7248\u672c {FORMULA_VERSION}</strong><br>{esc(INDICATOR_SPEC)}<br>\u4ec5\u5df2\u6536\u76d8K\u7ebf\uff5c\u666e\u901a\u80a1\u7968/\u6307\u6570Yahoo repair=True\uff5cA\u80a1ETF\u524d\u590d\u6743/\u62c6\u5206\u6821\u6b63+\u65b0\u6d6a\u6536\u76d8\u8865\u9f50\uff5c\u52a0\u5bc6\u8d27\u5e01\u6307\u5b9a\u4ea4\u6613\u6240\u5b98\u65b9API</div>'
     html_body = f"""<!doctype html>
 <html>
   <body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,'Microsoft YaHei',sans-serif;color:#111827;">
@@ -446,7 +446,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
         <strong>风险提醒：</strong>本报告只是技术筛选和复盘参考，不构成买卖建议。实际交易前请再核对券商/交易所实时行情、流动性和自身风险承受能力。
       </div>
       <div style="margin:12px 2px 0;color:#6b7280;font-size:12px;line-height:1.5;">
-        \u6570\u636e\u6e90\uff1a\u666e\u901a\u80a1\u7968/\u6307\u6570Yahoo\u4fee\u590dK\u7ebf\uff1bA\u80a1ETF\u4e1c\u65b9\u8d22\u5bcc/\u65b0\u6d6a\uff1b\u52a0\u5bc6\u8d27\u5e01\u7b26\u53f7\u5bf9\u5e94\u4ea4\u6613\u6240\u5b98\u65b9API\uff1b\u6307\u6807\u672c\u5730\u91cd\u7b97\u3002
+        \u6570\u636e\u6e90\uff1a\u666e\u901a\u80a1\u7968/\u6307\u6570Yahoo\u4fee\u590dK\u7ebf\uff1bA\u80a1ETF\u524d\u590d\u6743/\u62c6\u5206\u6821\u6b63+\u65b0\u6d6a\u6536\u76d8\u8865\u9f50\uff1b\u52a0\u5bc6\u8d27\u5e01\u7b26\u53f7\u5bf9\u5e94\u4ea4\u6613\u6240\u5b98\u65b9API\uff1b\u6307\u6807\u672c\u5730\u91cd\u7b97\u3002
       </div>
     </div>
   </body>

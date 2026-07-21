@@ -49,7 +49,7 @@ WEEKLY_J_LT_ZERO_EXTRA_BONUS = 15
 KDJ_N = 9
 KDJ_M1 = 3
 KDJ_M2 = 3
-FORMULA_VERSION = "2026-07-21-v2"
+FORMULA_VERSION = "2026-07-21-v3"
 INDICATOR_SPEC = "KDJ(9,3,3,RMA); SMA/EMA(20,60,120); ATR(14,RMA); MACD(12,26,9,EMA)"
 
 YAHOO_OVERRIDES = {
@@ -110,6 +110,12 @@ APPROXIMATE_MAPPINGS = {
 OFFICIAL_CRYPTO_VENUES = {"BINANCE", "BITGET", "COINBASE", "BITSTAMP", "OKX"}
 CRYPTO_QUOTES = ("USDT", "USDC", "FDUSD", "BUSD", "USD", "BTC", "ETH", "EUR", "GBP")
 SSE_ETF_LOCK = Lock()
+SSE_ETF_SPLITS: dict[str, tuple[tuple[str, float], ...]] = {
+    # Effective dates and ratios verified against Shanghai Stock Exchange notices.
+    "560780": (("2026-06-26", 3.0),),
+    "561980": (("2026-06-26", 5.0),),
+    "588170": (("2026-07-06", 3.0),),
+}
 
 
 def is_sse_etf(symbol: str) -> bool:
@@ -668,6 +674,94 @@ def fetch_official_crypto(symbol: str, timeframe: str, bars: int) -> pd.DataFram
     return fetcher(symbol, timeframe, bars)
 
 
+def parse_sina_sse_quote(payload: str, ticker: str) -> pd.DataFrame:
+    marker = f'var hq_str_sh{ticker}="'
+    start = payload.find(marker)
+    if start < 0:
+        raise ValueError(f"Sina quote missing for sh{ticker}")
+    start += len(marker)
+    end = payload.find('";', start)
+    if end < 0:
+        raise ValueError(f"malformed Sina quote for sh{ticker}")
+    fields = payload[start:end].split(",")
+    if len(fields) < 32 or not fields[30]:
+        raise ValueError(f"incomplete Sina quote for sh{ticker}")
+
+    quote_date = pd.Timestamp(fields[30])
+    values = {
+        "open": float(fields[1]),
+        "high": float(fields[4]),
+        "low": float(fields[5]),
+        "close": float(fields[3]),
+        "volume": float(fields[8]),
+    }
+    if min(values["open"], values["high"], values["low"], values["close"]) <= 0:
+        raise ValueError(f"non-positive Sina quote for sh{ticker}")
+    return pd.DataFrame([values], index=pd.DatetimeIndex([quote_date], name="date"))
+
+
+def fetch_sina_sse_quote(ticker: str) -> pd.DataFrame:
+    url = f"https://hq.sinajs.cn/list=sh{ticker}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Referer": "https://finance.sina.com.cn/",
+            "User-Agent": "Mozilla/5.0",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = response.read().decode("gb18030", errors="replace")
+    return parse_sina_sse_quote(payload, ticker)
+
+
+def merge_latest_quote(frame: pd.DataFrame, quote: pd.DataFrame) -> pd.DataFrame:
+    combined = frame.copy()
+    for quote_date, row in quote.iterrows():
+        combined.loc[pd.Timestamp(quote_date), ["open", "high", "low", "close", "volume"]] = row[
+            ["open", "high", "low", "close", "volume"]
+        ]
+    return combined.sort_index()
+
+
+def apply_sse_split_adjustments(frame: pd.DataFrame, ticker: str) -> tuple[pd.DataFrame, list[str]]:
+    out = frame.copy()
+    adjustments: list[str] = []
+    price_columns = ["open", "high", "low", "close"]
+    for effective_date, factor in SSE_ETF_SPLITS.get(ticker, ()):
+        effective = pd.Timestamp(effective_date)
+        before = out.index < effective
+        after = out.index >= effective
+        if not before.any() or not after.any():
+            continue
+        before_close = float(out.loc[before, "close"].iloc[-1])
+        after_close = float(out.loc[after, "close"].iloc[0])
+        observed_ratio = before_close / after_close
+        if 0.70 <= observed_ratio <= 1.30:
+            continue
+        if not 0.70 <= observed_ratio / factor <= 1.30:
+            raise ValueError(
+                f"split ratio check failed for {ticker} at {effective_date}: "
+                f"observed={observed_ratio:.4f}, expected={factor:g}"
+            )
+        out.loc[before, price_columns] = out.loc[before, price_columns] / factor
+        out.loc[before, "volume"] = out.loc[before, "volume"] * factor
+        adjustments.append(f"{effective_date} 1:{factor:g}")
+    return out, adjustments
+
+
+def reject_unadjusted_split_gaps(frame: pd.DataFrame, ticker: str) -> None:
+    ratios = frame["close"] / frame["close"].shift(1)
+    for date_value, ratio_value in ratios.dropna().items():
+        ratio = float(ratio_value)
+        for factor in (2.0, 3.0, 4.0, 5.0, 10.0):
+            normalized = ratio * factor if ratio < 1.0 else ratio / factor
+            if (ratio < 0.60 or ratio > 1.70) and 0.75 <= normalized <= 1.25:
+                raise ValueError(
+                    f"possible unadjusted ETF split for {ticker} at "
+                    f"{pd.Timestamp(date_value).date().isoformat()}; factor~{factor:g}"
+                )
+
+
 def fetch_sse_etf(symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
     try:
         import akshare as ak
@@ -681,7 +775,7 @@ def fetch_sse_etf(symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
     end_date = local_now.date().strftime("%Y%m%d")
     raw: pd.DataFrame | None = None
     last_error: Exception | None = None
-    source_name = "Eastmoney"
+    source_name = "Eastmoney qfq"
     with SSE_ETF_LOCK:
         for attempt in range(2):
             try:
@@ -690,7 +784,7 @@ def fetch_sse_etf(symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
                     period="daily",
                     start_date=start_date,
                     end_date=end_date,
-                    adjust="",
+                    adjust="qfq",
                 )
                 if raw is not None and not raw.empty:
                     break
@@ -701,7 +795,7 @@ def fetch_sse_etf(symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
         if raw is None or raw.empty:
             try:
                 raw = ak.fund_etf_hist_sina(symbol=f"sh{ticker}")
-                source_name = "Sina Finance"
+                source_name = "Sina Finance raw"
             except Exception as exc:
                 last_error = exc
     if raw is None or raw.empty:
@@ -720,15 +814,49 @@ def fetch_sse_etf(symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
     frame = renamed.set_index("date")[["open", "high", "low", "close", "volume"]]
     frame.index = pd.to_datetime(frame.index)
     frame = normalize_ohlcv(frame)
+
+    split_adjustments: list[str] = []
+    if source_name == "Sina Finance raw":
+        frame, split_adjustments = apply_sse_split_adjustments(frame, ticker)
+    reject_unadjusted_split_gaps(frame, ticker)
+
+    quote_note = "Sina close quote unavailable"
+    try:
+        quote = fetch_sina_sse_quote(ticker)
+        frame = merge_latest_quote(frame, quote)
+        quote_note = f"Sina close quote merged through {quote.index[-1].date().isoformat()}"
+    except Exception as exc:
+        quote_note = f"Sina close quote unavailable ({type(exc).__name__})"
+
+    frame = normalize_ohlcv(frame)
     frame = drop_unconfirmed_rows(frame, "china")
     validate_ohlcv(frame)
+    if frame.empty:
+        raise ValueError(f"no completed SSE ETF bars: {ticker}")
+    latest_age = (local_now.date() - frame.index[-1].date()).days
+    if latest_age > 4:
+        raise ValueError(
+            f"stale SSE ETF data for {ticker}: latest={frame.index[-1].date().isoformat()}"
+        )
     if timeframe == "weekly":
         frame = aggregate_weekly(frame, "china")
         validate_ohlcv(frame)
     if len(frame) > bars:
         frame = frame.tail(bars).copy()
-    frame.attrs["source"] = f"{source_name} via AKShare ({ticker}, unadjusted SSE ETF daily)"
-    frame.attrs["data_quality"] = f"exact SSE ETF symbol; {source_name}; completed bars; OHLC validation passed"
+
+    adjustment_note = (
+        "Eastmoney qfq"
+        if source_name == "Eastmoney qfq"
+        else "Sina split-adjusted"
+        + (f" ({', '.join(split_adjustments)})" if split_adjustments else "")
+    )
+    frame.attrs["source"] = (
+        f"{source_name} via AKShare + Sina close quote ({ticker}, {adjustment_note})"
+    )
+    frame.attrs["data_quality"] = (
+        f"exact SSE ETF symbol; {adjustment_note}; {quote_note}; "
+        "completed bars; recency and OHLC validation passed"
+    )
     return frame
 
 
@@ -1184,7 +1312,7 @@ def scan(
             sections[key] = sorted(sections[key], key=lambda c: c.sort_tuple())[:th.max_items_per_section]
     return {
         "timeframe": timeframe,
-        "source": "Equities/indices: Yahoo repaired; SSE ETFs: Eastmoney/Sina; crypto: exact-venue official APIs",
+        "source": "Equities/indices: Yahoo repaired; SSE ETFs: qfq/split-adjusted + Sina close; crypto: exact-venue official APIs",
         "formula_version": FORMULA_VERSION,
         "indicator_spec": INDICATOR_SPEC,
         "bar_policy": "confirmed bars only",
@@ -1250,6 +1378,38 @@ def self_test() -> None:
     assert official_crypto_id("COINBASE:BTCUSD") == "BTC-USD"
     assert official_crypto_id("BINANCE:ETHBTC") == "ETHBTC"
     assert is_sse_etf("SSE:561980") and not is_sse_etf("SSE:600519")
+    quote_fields = [
+        "ETF", "0.979", "0.966", "1.063", "1.063", "0.930", "0", "0", "12345", "6789",
+        *(["0"] * 20),
+        "2026-07-21", "15:34:59",
+    ]
+    parsed_quote = parse_sina_sse_quote(
+        f'var hq_str_sh560780="{",".join(quote_fields)}";',
+        "560780",
+    )
+    assert parsed_quote.index[-1].date().isoformat() == "2026-07-21"
+    assert abs(float(parsed_quote["close"].iloc[-1]) - 1.063) < 1e-12
+
+    split_dates = pd.to_datetime(["2026-06-24", "2026-06-25", "2026-06-26", "2026-06-29"])
+    split_close = pd.Series([3.0, 3.06, 1.02, 1.05], index=split_dates)
+    split_frame = pd.DataFrame({
+        "open": split_close,
+        "high": split_close * 1.01,
+        "low": split_close * 0.99,
+        "close": split_close,
+        "volume": 1000.0,
+    })
+    adjusted_split, split_events = apply_sse_split_adjustments(split_frame, "560780")
+    assert split_events == ["2026-06-26 1:3"]
+    assert abs(float(adjusted_split["close"].iloc[1]) - 1.02) < 1e-12
+    reject_unadjusted_split_gaps(adjusted_split, "560780")
+    try:
+        reject_unadjusted_split_gaps(split_frame, "TEST")
+        raise AssertionError("unadjusted split gap was not rejected")
+    except ValueError as exc:
+        assert "possible unadjusted ETF split" in str(exc)
+
+
 
 
     ind = add_indicators(df)

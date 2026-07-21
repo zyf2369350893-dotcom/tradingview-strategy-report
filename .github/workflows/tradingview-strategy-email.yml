@@ -1,13 +1,6 @@
 name: TradingView Strategy Email Report
 
 on:
-  push:
-    branches:
-      - agent/precision-market-data
-    paths:
-      - '.github/workflows/tradingview-strategy-email.yml'
-      - 'hermes-skills/tradingview-market-scan/scripts/**'
-      - 'requirements.txt'
   schedule:
     # Beijing 09:10 daily: 70-minute buffer after the UTC crypto daily close
     - cron: '10 1 * * *'
@@ -53,9 +46,6 @@ jobs:
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             echo "type=${{ inputs.report_type }}" >> "$GITHUB_OUTPUT"
             echo "dry_run=${{ inputs.dry_run }}" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ github.event_name }}" == "push" ]]; then
-            echo "type=daily" >> "$GITHUB_OUTPUT"
-            echo "dry_run=false" >> "$GITHUB_OUTPUT"
           elif [[ "${{ github.event.schedule }}" == "25 1 * * 1" ]]; then
             echo "type=weekly" >> "$GITHUB_OUTPUT"
             echo "dry_run=false" >> "$GITHUB_OUTPUT"
@@ -79,16 +69,3 @@ jobs:
             args+=(--dry-run)
           fi
           python hermes-skills/tradingview-market-scan/scripts/send_strategy_report.py "${args[@]}"
-
-      - name: Send weekly report for release validation
-        if: github.event_name == 'push' && github.ref == 'refs/heads/agent/precision-market-data'
-        env:
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          SMTP_TLS: ${{ secrets.SMTP_TLS }}
-          MAIL_FROM: ${{ secrets.MAIL_FROM }}
-          MAIL_TO: ${{ secrets.MAIL_TO }}
-        run: |
-          python hermes-skills/tradingview-market-scan/scripts/send_strategy_report.py --report-type weekly
