@@ -559,7 +559,7 @@ def crypto_surge_plain(rows: list[dict[str, object]], errors: list[str]) -> list
         lines.append("结论：最新已完成日线未发现明显加速或暴涨。")
     else:
         lines.append("触发名单：" + "、".join(f"{row['ticker']}（{row['level']}）" for row in triggered))
-    for row in rows:
+    for row in triggered:
         line = (
             f"- {row['ticker']}｜{row['bar_date']}｜{row['level']}｜涨幅 {fmt_pct(row['change'])}｜"
             f"P90/P95/P99 {fmt_float(row['p90'])}%/{fmt_float(row['p95'])}%/{fmt_float(row['p99'])}%｜"
@@ -599,7 +599,7 @@ def crypto_surge_html(rows: list[dict[str, object]], errors: list[str]) -> str:
         "正常波动": ("#f3f4f6", "#4b5563"),
     }
     cards: list[str] = []
-    for row in rows:
+    for row in triggered:
         background, color = level_colors.get(str(row["level"]), ("#f3f4f6", "#4b5563"))
         cross_check = (
             f'<div style="margin-top:5px;color:#6b7280;font-size:12px;">BTC交叉核对：{esc(row["cross_check"])}</div>'
