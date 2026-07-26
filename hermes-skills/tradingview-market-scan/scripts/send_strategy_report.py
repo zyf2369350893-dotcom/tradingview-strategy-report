@@ -8,6 +8,7 @@ import os
 import re
 import smtplib
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
@@ -28,6 +29,10 @@ from market_scan_local import (
     WEEKLY_J_LT_ZERO_EXTRA_BONUS,
     Thresholds,
     candidate_to_dict,
+    fetch_official_crypto,
+    load_symbols,
+    rma,
+    true_range,
     scan,
 )
 
@@ -432,6 +437,213 @@ def weekly_priority_html(rows: list[dict[str, object]]) -> str:
 
 
 
+def classify_crypto_surge(
+    change: float,
+    p90: float,
+    p95: float,
+    p99: float,
+    volume_ratio: float | None,
+) -> tuple[str, int]:
+    if change >= p99 or (change >= p95 and volume_ratio is not None and volume_ratio >= 2.0):
+        return "极端暴涨", 3
+    if change >= p95:
+        return "暴涨", 2
+    if change >= p90:
+        return "明显加速", 1
+    return "正常波动", 0
+
+
+def crypto_surge_monitor() -> tuple[list[dict[str, object]], list[str]]:
+    """Compare the latest completed UTC daily return with each series' own history."""
+    symbols = load_symbols(CRYPTO).get("crypto", [])
+    raw_rows: dict[str, dict[str, object]] = {}
+    errors: list[str] = []
+
+    def calculate(symbol: str) -> dict[str, object]:
+        frame = fetch_official_crypto(symbol, "daily", 380)
+        if len(frame) < 120:
+            raise ValueError(f"已完成日线不足（{len(frame)}<120）")
+
+        returns = frame["close"].pct_change() * 100.0
+        history = returns.iloc[:-1].dropna().tail(365)
+        positive = history[history > 0]
+        if len(positive) < 50:
+            raise ValueError(f"历史上涨日不足（{len(positive)}<50）")
+
+        latest_change = float(returns.iloc[-1])
+        p90 = float(positive.quantile(0.90))
+        p95 = float(positive.quantile(0.95))
+        p99 = float(positive.quantile(0.99))
+        percentile = (
+            float((positive <= latest_change).sum()) / float(len(positive)) * 100.0
+            if latest_change > 0
+            else 0.0
+        )
+
+        atr = rma(true_range(frame), 14)
+        previous_close = float(frame["close"].iloc[-2])
+        atr_pct = float(atr.iloc[-1]) / previous_close * 100.0 if previous_close > 0 else 0.0
+        atr_multiple = latest_change / atr_pct if atr_pct > 0 else None
+
+        volume_history = frame["volume"].iloc[-21:-1]
+        average_volume = float(volume_history.mean()) if len(volume_history) else 0.0
+        latest_volume = float(frame["volume"].iloc[-1])
+        volume_ratio = latest_volume / average_volume if average_volume > 0 else None
+        level, severity = classify_crypto_surge(
+            latest_change,
+            p90,
+            p95,
+            p99,
+            volume_ratio,
+        )
+
+        exchange, ticker = symbol.split(":", 1)
+        return {
+            "symbol": symbol,
+            "exchange": exchange,
+            "ticker": ticker,
+            "bar_date": frame.index[-1].date().isoformat(),
+            "change": latest_change,
+            "p90": p90,
+            "p95": p95,
+            "p99": p99,
+            "percentile": percentile,
+            "atr_multiple": atr_multiple,
+            "volume_ratio": volume_ratio,
+            "level": level,
+            "severity": severity,
+            "history_up_days": len(positive),
+            "source": frame.attrs.get("source", ""),
+        }
+
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(symbols)))) as pool:
+        future_map = {pool.submit(calculate, symbol): symbol for symbol in symbols}
+        for future in as_completed(future_map):
+            symbol = future_map[future]
+            try:
+                raw_rows[symbol] = future.result()
+            except Exception as exc:
+                errors.append(f"暴涨监测 {symbol}: {type(exc).__name__}: {exc}")
+
+    primary_btc = raw_rows.get("COINBASE:BTCUSD")
+    comparison_btc = raw_rows.get("BITSTAMP:BTCUSD")
+    if primary_btc and comparison_btc:
+        primary_change = float(primary_btc["change"])
+        comparison_change = float(comparison_btc["change"])
+        difference = abs(primary_change - comparison_change)
+        same_direction = (primary_change >= 0) == (comparison_change >= 0)
+        primary_btc["cross_check"] = (
+            f"Bitstamp {comparison_change:+.2f}%，"
+            f"{'方向一致' if same_direction else '方向不一致'}，差 {difference:.2f} 个百分点"
+        )
+
+    display_rows = [
+        row
+        for symbol, row in raw_rows.items()
+        if symbol != "BITSTAMP:BTCUSD"
+    ]
+    display_rows.sort(
+        key=lambda row: (
+            -int(row["severity"]),
+            -float(row["percentile"]),
+            -float(row["change"]),
+            str(row["symbol"]),
+        )
+    )
+    return display_rows, sorted(errors)
+
+
+def crypto_surge_plain(rows: list[dict[str, object]], errors: list[str]) -> list[str]:
+    lines = [
+        "加密资产最新日线暴涨监测（独立模块）",
+        "规则：P90=明显加速；P95=暴涨；P99或P95且成交量≥20日均量2倍=极端暴涨。阈值按各币最近365个已完成日线中的上涨日滚动计算。",
+    ]
+    triggered = [row for row in rows if int(row["severity"]) > 0]
+    if not triggered:
+        lines.append("结论：最新已完成日线未发现明显加速或暴涨。")
+    else:
+        lines.append("触发名单：" + "、".join(f"{row['ticker']}（{row['level']}）" for row in triggered))
+    for row in rows:
+        line = (
+            f"- {row['ticker']}｜{row['bar_date']}｜{row['level']}｜涨幅 {fmt_pct(row['change'])}｜"
+            f"P90/P95/P99 {fmt_float(row['p90'])}%/{fmt_float(row['p95'])}%/{fmt_float(row['p99'])}%｜"
+            f"历史分位 {fmt_float(row['percentile'], 1)}%｜ATR {fmt_float(row['atr_multiple'])}倍｜"
+            f"成交量 {fmt_float(row['volume_ratio'])}倍"
+        )
+        if row.get("cross_check"):
+            line += f"｜交叉核对：{row['cross_check']}"
+        lines.append(line)
+    if errors:
+        lines.append("监测缺失：" + "；".join(errors))
+    lines.append("")
+    return lines
+
+
+def crypto_surge_html(rows: list[dict[str, object]], errors: list[str]) -> str:
+    triggered = [row for row in rows if int(row["severity"]) > 0]
+    if triggered:
+        summary = "、".join(
+            f"{esc(row['ticker'])}（{esc(row['level'])} {fmt_pct(row['change'])}）"
+            for row in triggered
+        )
+        summary_html = (
+            '<div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;'
+            f'padding:11px 12px;color:#9a3412;font-weight:700;">触发：{summary}</div>'
+        )
+    else:
+        summary_html = (
+            '<div style="background:#ecfdf3;border:1px solid #abefc6;border-radius:8px;'
+            'padding:11px 12px;color:#067647;font-weight:700;">最新已完成日线未发现明显加速或暴涨</div>'
+        )
+
+    level_colors = {
+        "极端暴涨": ("#fef2f2", "#b42318"),
+        "暴涨": ("#fff7ed", "#c2410c"),
+        "明显加速": ("#fffbeb", "#a16207"),
+        "正常波动": ("#f3f4f6", "#4b5563"),
+    }
+    cards: list[str] = []
+    for row in rows:
+        background, color = level_colors.get(str(row["level"]), ("#f3f4f6", "#4b5563"))
+        cross_check = (
+            f'<div style="margin-top:5px;color:#6b7280;font-size:12px;">BTC交叉核对：{esc(row["cross_check"])}</div>'
+            if row.get("cross_check")
+            else ""
+        )
+        cards.append(f"""
+          <div style="border:1px solid #e5e7eb;border-radius:8px;padding:11px 12px;margin-top:8px;background:#fff;">
+            <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;">
+              <div style="font-weight:800;color:#111827;">{esc(row["ticker"])} <span style="font-size:11px;color:#6b7280;">{esc(row["exchange"])}</span></div>
+              <span style="background:{background};color:{color};border-radius:999px;padding:4px 8px;font-size:12px;font-weight:700;">{esc(row["level"])}</span>
+            </div>
+            <div style="margin-top:7px;font-size:13px;color:#374151;line-height:1.6;">
+              {esc(row["bar_date"])}｜涨幅 <strong>{esc(fmt_pct(row["change"]))}</strong>｜历史分位 {esc(fmt_float(row["percentile"], 1))}%<br>
+              P90/P95/P99：{esc(fmt_float(row["p90"]))}% / {esc(fmt_float(row["p95"]))}% / {esc(fmt_float(row["p99"]))}%<br>
+              ATR强度：{esc(fmt_float(row["atr_multiple"]))}倍｜成交量：{esc(fmt_float(row["volume_ratio"]))}倍20日均量
+            </div>
+            {cross_check}
+          </div>
+        """)
+
+    error_html = ""
+    if errors:
+        error_html = (
+            '<div style="margin-top:8px;color:#b42318;font-size:12px;line-height:1.5;">监测缺失：'
+            + esc("；".join(errors))
+            + "</div>"
+        )
+    return f"""
+      <section style="margin-top:22px;">
+        <h2 style="font-size:18px;margin:0 0 8px;color:#111827;">加密资产最新日线暴涨监测</h2>
+        <div style="font-size:12px;color:#6b7280;line-height:1.55;margin-bottom:10px;">
+          独立于均线和KDJ：P90=明显加速；P95=暴涨；P99或P95且成交量≥20日均量2倍=极端暴涨。阈值按各币自身历史动态更新。
+        </div>
+        {summary_html}
+        {''.join(cards)}
+        {error_html}
+      </section>
+    """
+
 def build_fix_notice() -> tuple[str, str, str]:
     now = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
     subject = f"【已修复】561980周线KDJ J值差异说明｜{now} 北京时间"
@@ -491,6 +703,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
     th = Thresholds(max_items_per_section=max_items)
     watch = scan(WATCHLIST, timeframe, th, crypto_dense_only=False)
     crypto = scan(CRYPTO, timeframe, th, crypto_dense_only=True)
+    surge_rows, surge_errors = crypto_surge_monitor()
     now = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
     report_name = zh_report_name(report_type)
     timeframe_name = zh_timeframe(report_type)
@@ -514,7 +727,8 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
             f"1. 自选列表：均线密集需同时满足 ATR 压缩和六线跨度占比；J<20按深度加分，J<0时KDJ最高 +{KDJ_MAX_BONUS} 分。",
             "2. 回踩20日与60日均线并列；J值权重同上，若J值向上勾头再加15分。",
             f"3. MACD约占15%辅助权重，最高±{MACD_MAX_SCORE}分：DIF识别±4、柱体共振再±3、正式确认再±5；3日内全分，4至7日半分，超过7日只显示不计分。",
-            "4. 加密列表：目前只看均线密集；密集后J<0作为加分项。",
+            "4. 加密暴涨监测独立运行：P90为明显加速、P95为暴涨、P99或P95且放量2倍为极端暴涨，不受均线/KDJ限制。",
+            "5. 加密列表的常规候选仍只看均线密集；密集后J<0作为加分项。",
         ]
 
     if report_type == "weekly":
@@ -544,6 +758,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
         "筛选优先级：",
         *priority_lines,
         "",
+        *crypto_surge_plain(surge_rows, surge_errors),
         f"自选列表：数据返回 {watch.get('rows_count')}/{watch.get('symbols_count')}；未返回/数据不足：{missing_text(watch)}",
     ]
     if report_type == "weekly":
@@ -557,7 +772,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
 
     plain_lines.append(f"\u4e25\u683c\u6a21\u5f0f\u6392\u9664\uff08\u81ea\u9009\uff09\uff1a{excluded_text(watch)}")
     plain_lines.append(f"\u4e25\u683c\u6a21\u5f0f\u6392\u9664\uff08\u52a0\u5bc6\uff09\uff1a{excluded_text(crypto)}")
-    errors = list(watch.get("errors") or []) + list(crypto.get("errors") or [])
+    errors = list(watch.get("errors") or []) + list(crypto.get("errors") or []) + surge_errors
     if errors:
         plain_lines.append("数据备注：")
         for err in errors[:20]:
@@ -606,6 +821,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
 
       {weekly_priority_section}
       {precision_html}
+      {crypto_surge_html(surge_rows, surge_errors)}
       {section_html("自选列表候选", watch, watch_rows)}
       {section_html("加密列表均线密集", crypto, crypto_rows)}
       {error_html}
