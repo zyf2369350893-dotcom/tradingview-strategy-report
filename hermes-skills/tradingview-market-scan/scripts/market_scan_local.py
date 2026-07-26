@@ -234,6 +234,7 @@ class Candidate:
     tags: list[str] = field(default_factory=list)
     j: float | None = None
     prev_j: float | None = None
+    kdj_score: int = 0
     macd: str | None = None
     macd_divergence: str = ""
     macd_divergence_score: int = 0
@@ -1418,6 +1419,7 @@ def weekly_j_lt_zero_candidate(
         macd=macd,
         macd_divergence=macd_div,
         macd_divergence_score=macd_div_score,
+        kdj_score=kdj_score,
         kdj_weight_cap=total_kdj_weight,
         score=clamp_score(WEEKLY_PRIORITY_BASE_SCORE + kdj_score + macd_div_score),
         kdj_note=note,
@@ -1520,6 +1522,7 @@ def classify_frame(
             kind=DENSE,
             reason=f"six-line width {density:.2f}ATR/{width_pct * 100:.1f}%, price distance {price_dist:.2f}ATR, close above 20 group",
             score=score,
+            kdj_score=kdj_bonus,
             kdj_note=note,
             **base,
         ))
@@ -1552,9 +1555,10 @@ def classify_frame(
         close_distance_atr = zone_distance(close, group_low, group_high) / atr
         low_distance_atr = zone_distance(low, group_low, group_high) / atr
         score = 44 + 15 + max(0, 10 - close_distance_atr * 12)
-        score += kdj_j_bonus(j, max_bonus=kdj_base_max_bonus) + weekly_j_extra_bonus
+        kdj_score = kdj_j_bonus(j, max_bonus=kdj_base_max_bonus) + weekly_j_extra_bonus
         if j_hook and not kdj_fallback:
-            score += 15
+            kdj_score += 15
+        score += kdj_score
         if change and change > 0:
             score += 3
         score += macd_div_score
@@ -1565,6 +1569,7 @@ def classify_frame(
             "group_high": group_high,
             "close_distance_atr": close_distance_atr,
             "low_distance_atr": low_distance_atr,
+            "kdj_score": kdj_score,
             "score": clamp_score(score),
         }
 
@@ -1586,6 +1591,7 @@ def classify_frame(
                 f"low distance {float(nearest['low_distance_atr']):.2f}ATR"
             ),
             score=int(nearest["score"]),
+            kdj_score=int(nearest["kdj_score"]),
             kdj_note=note,
             fresh_pullback=True,
             **base,
@@ -1755,6 +1761,7 @@ def candidate_to_dict(c: Candidate) -> dict[str, Any]:
         "macd": c.macd,
         "macd_divergence": c.macd_divergence,
         "macd_divergence_score": c.macd_divergence_score,
+        "kdj_score": c.kdj_score,
         "kdj_weight_cap": c.kdj_weight_cap,
         "score": c.score,
         "kdj_note": c.kdj_note,

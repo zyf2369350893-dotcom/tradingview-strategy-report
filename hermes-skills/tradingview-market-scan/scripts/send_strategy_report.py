@@ -300,9 +300,8 @@ def plain_candidates(title: str, rows: list[dict[str, object]]) -> list[str]:
         parts = [
             f"{idx}. {row.get('symbol')}｜{zh_kind(row.get('kind'))}｜评分 {row.get('score')}",
             f"收盘 {fmt_float(row.get('close'))}｜涨跌 {fmt_pct(row.get('change'))}｜J {fmt_float(row.get('j'), 1)}",
-            f"KDJ：{zh_kdj_note(row.get('kdj_note'))}",
-            f"KDJ数据：{zh_kdj_source(row.get('source'))}；权重上限 {fmt_kdj_weight_cap(row.get('kdj_weight_cap'))}",
-            f"MACD：{zh_macd(row.get('macd'))}；{zh_divergence(row.get('macd_divergence'))}；计分 {fmt_macd_score(row.get('macd_divergence_score'))}",
+            f"KDJ实际计分：{fmt_macd_score(row.get('kdj_score'))}",
+            f"MACD辅助计分：{fmt_macd_score(row.get('macd_divergence_score'))}",
             f"原因：{zh_reason(row.get('reason'))}",
         ]
         macd_badge, _ = macd_divergence_badge(row.get("macd_divergence"), row.get("macd_divergence_score"))
@@ -325,10 +324,7 @@ def card_html(row: dict[str, object], idx: int) -> str:
     change = esc(fmt_pct(row.get("change")))
     j_value = esc(fmt_float(row.get("j"), 1))
     kdj = esc(zh_kdj_note(row.get("kdj_note")))
-    kdj_source = esc(zh_kdj_source(row.get("source")))
-    kdj_weight_cap = esc(fmt_kdj_weight_cap(row.get("kdj_weight_cap")))
-    macd = esc(zh_macd(row.get("macd")))
-    div = esc(zh_divergence(row.get("macd_divergence")))
+    kdj_score = esc(fmt_macd_score(row.get("kdj_score")))
     macd_score = esc(fmt_macd_score(row.get("macd_divergence_score")))
     macd_badge = macd_badge_html(row.get("macd_divergence"), row.get("macd_divergence_score"))
     reason = esc(zh_reason(row.get("reason")))
@@ -367,12 +363,12 @@ def card_html(row: dict[str, object], idx: int) -> str:
             <td style="padding:5px 0;text-align:right;font-weight:700;color:#111827;">{j_value}</td>
           </tr>
           <tr>
-            <td style="padding:5px 0;color:#6b7280;">KDJ数据</td>
-            <td style="padding:5px 0;text-align:right;color:#111827;">{kdj_source}；权重上限 {kdj_weight_cap}</td>
+            <td style="padding:5px 0;color:#6b7280;">KDJ实际计分</td>
+            <td style="padding:5px 0;text-align:right;font-weight:700;color:#111827;">{kdj_score}</td>
           </tr>
           <tr>
-            <td style="padding:5px 0;color:#6b7280;">MACD辅助</td>
-            <td style="padding:5px 0;text-align:right;color:#111827;">{macd}；{div}；计分 {macd_score}</td>
+            <td style="padding:5px 0;color:#6b7280;">MACD辅助计分</td>
+            <td style="padding:5px 0;text-align:right;font-weight:700;color:#111827;">{macd_score}</td>
           </tr>
           <tr>
             <td style="padding:5px 0;color:#6b7280;">K\u7ebf\u65e5\u671f</td>
