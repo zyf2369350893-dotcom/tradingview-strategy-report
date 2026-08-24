@@ -607,6 +607,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
     priority_html_items = "".join(f"<li>{esc(item[3:])}</li>" for item in priority_lines)
     weekly_priority_section = weekly_priority_html(weekly_priority_rows) if report_type == "weekly" else ""
     daily_crypto_priority_section = daily_crypto_priority_html(daily_crypto_priority_rows) if report_type == "daily" else ""
+    crypto_section_title = "\u52a0\u5bc6\u5217\u8868\u5019\u9009\uff08\u5747\u7ebf\u5bc6\u96c6/\u56de\u8e2920/\u56de\u8e2960\uff09"
 
     precision_html = f'<div style="background:#ecfdf3;border:1px solid #abefc6;border-radius:10px;margin-top:12px;padding:12px 16px;color:#05603a;font-size:13px;line-height:1.6;"><strong>\u7cbe\u5ea6\u7248\u672c {FORMULA_VERSION}</strong><br>{esc(INDICATOR_SPEC)}<br>\u4ec5\u5df2\u6536\u76d8K\u7ebf\uff5c\u666e\u901a\u80a1\u7968/\u6307\u6570Yahoo repair=True\uff5cA\u80a1ETF\u524d\u590d\u6743/\u62c6\u5206\u6821\u6b63+\u65b0\u6d6a\u6536\u76d8\u8865\u9f50\uff5c\u52a0\u5bc6\u8d27\u5e01\u6307\u5b9a\u4ea4\u6613\u6240\u5b98\u65b9API</div>'
     html_body = f"""<!doctype html>
@@ -630,7 +631,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
       {daily_crypto_priority_section}
       {precision_html}
       {section_html("自选列表候选", watch, watch_rows)}
-      {section_html("\u52a0\u5bc6\u5217\u8868\u5019\u9009\uff08\u5747\u7ebf\u5bc6\u96c6/\u56de\u8e2920/\u56de\u8e2960\uff09", crypto, crypto_rows)}
+      {section_html(crypto_section_title, crypto, crypto_rows)}
       {error_html}
 
       <div style="margin-top:22px;background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:13px 15px;color:#9a3412;font-size:13px;line-height:1.6;">
