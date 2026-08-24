@@ -5,6 +5,8 @@ Automated daily and weekly TradingView strategy reports.
 - Daily: Beijing time 09:10 every day (completed UTC crypto day and latest completed stock sessions).
 - Weekly: Beijing time 09:25, Monday (completed equity and UTC crypto weeks).
 - Signals use confirmed bars only.
+- Crypto uses the same regular scan as equities: six-line MA density plus trend pullbacks to the MA/EMA20 or MA/EMA60 groups.
+- Crypto daily KDJ J<0 is listed independently in the daily email; weekly KDJ J<0 remains independently listed in the weekly email.
 - KDJ is the custom Pine formula KDJ(9,3,3,RMA), not standard Stochastic.
 - Regular equities/indices use repaired Yahoo data; SSE ETFs use qfq/split-adjusted history plus the latest completed Sina close quote.
 - Crypto uses the official public API of the exact TradingView exchange prefix.

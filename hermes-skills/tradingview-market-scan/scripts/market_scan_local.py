@@ -58,6 +58,7 @@ TRADINGVIEW_KDJ_ALIASES = {
 DENSE = "\u5747\u7ebf\u5bc6\u96c6"
 PULL20 = "\u56de\u8e2920"
 PULL60 = "\u56de\u8e2960"
+DAILY_J_LT_ZERO = "\u65e5\u7ebfJ<0"
 WEEKLY_J_LT_ZERO = "\u5468\u7ebfJ<0"
 
 KDJ_MAX_BONUS = 35
@@ -66,7 +67,7 @@ KDJ_FALLBACK_MAX_BONUS = 15
 KDJ_N = 9
 KDJ_M1 = 3
 KDJ_M2 = 3
-FORMULA_VERSION = "2026-07-21-v5"
+FORMULA_VERSION = "2026-08-24-v6"
 INDICATOR_SPEC = "KDJ(9,3,3,RMA); SMA/EMA(20,60,120); ATR(14,RMA); MACD(12,26,9,EMA)"
 
 MACD_IDENTIFICATION_SCORE = 4
@@ -247,7 +248,7 @@ class Candidate:
     data_quality: str = "OHLC validation passed"
 
     def sort_tuple(self) -> tuple[int, int, float, float]:
-        kind_score = {WEEKLY_J_LT_ZERO: -1, DENSE: 0, PULL20: 1, PULL60: 1}.get(self.kind, 9)
+        kind_score = {DAILY_J_LT_ZERO: -1, WEEKLY_J_LT_ZERO: -1, DENSE: 0, PULL20: 1, PULL60: 1}.get(self.kind, 9)
         density = self.density if self.density is not None else 999.0
         j_value = self.j if self.j is not None else 999.0
         return (kind_score, -self.score, j_value, density)
@@ -1426,6 +1427,75 @@ def weekly_j_lt_zero_candidate(
         data_quality=str(df.attrs.get("data_quality", "OHLC validation passed")),
     )
 
+
+def daily_j_lt_zero_candidate(
+    tv_symbol: str,
+    provider_symbol: str,
+    market: str,
+    df: pd.DataFrame,
+    source: str = "yfinance-local",
+    kdj_fallback: bool = False,
+) -> Candidate | None:
+    """Build an independent crypto daily J<0 candidate without MA requirements."""
+    if len(df) < 2:
+        return None
+    row = df.iloc[-1]
+    prev = df.iloc[-2]
+    close = clean_float(row.get("close"))
+    j = clean_float(row.get("J"))
+    if close is None or j is None or j >= 0:
+        return None
+
+    prev_j = clean_float(prev.get("J"))
+    note, _ = kdj_note(j, prev_j)
+    prev_close = clean_float(prev.get("close"))
+    change = (close / prev_close - 1.0) * 100.0 if prev_close else None
+    atr = clean_float(row.get("ATR"))
+    ma_values = [clean_float(row.get(key)) for key in ["SMA20", "EMA20", "SMA60", "EMA60", "SMA120", "EMA120"]]
+    density = None
+    if atr is not None and atr > 0 and all(value is not None for value in ma_values):
+        valid_ma_values = [value for value in ma_values if value is not None]
+        density = (max(valid_ma_values) - min(valid_ma_values)) / atr
+
+    dif = clean_float(row.get("MACD_DIF"))
+    dea = clean_float(row.get("MACD_DEA"))
+    macd = None if dif is None or dea is None else ("DIF>=DEA" if dif >= dea else "DIF<DEA")
+    macd_div, macd_div_score = recent_macd_divergence(df, timeframe="daily")
+    total_kdj_weight = KDJ_FALLBACK_MAX_BONUS if kdj_fallback else KDJ_MAX_BONUS
+    kdj_score = kdj_j_bonus(j, max_bonus=total_kdj_weight)
+    weight_label = "\u5907\u7528\u4f4e\u6743\u91cd" if kdj_fallback else "\u6b63\u5f0f\u6743\u91cd"
+    tags = ["J<0"] + (["KDJ_FALLBACK"] if kdj_fallback else [])
+    divergence_side = macd_divergence_side(macd_div)
+    if divergence_side:
+        tags.append(f"MACD_{divergence_side}_DIV")
+    return Candidate(
+        symbol=tv_symbol,
+        yahoo=provider_symbol,
+        name=tv_symbol.split(":")[-1],
+        market=market,
+        close=close,
+        change=change,
+        density=density,
+        kind=DAILY_J_LT_ZERO,
+        reason=(
+            f"\u65e5\u7ebfKDJ J\u503c{j:.1f}<0\uff0c{weight_label} +{kdj_score}/{total_kdj_weight}\u5206\uff1b"
+            "\u8be5\u52a0\u5bc6\u8d27\u5e01\u540d\u5355\u4e0d\u8981\u6c42\u540c\u65f6\u6ee1\u8db3\u5747\u7ebf\u5bc6\u96c6\u6216\u56de\u8e29\u6761\u4ef6"
+        ),
+        tags=tags,
+        j=j,
+        prev_j=prev_j,
+        macd=macd,
+        macd_divergence=macd_div,
+        macd_divergence_score=macd_div_score,
+        kdj_weight_cap=total_kdj_weight,
+        score=clamp_score(50 + kdj_score + macd_div_score),
+        kdj_note=note,
+        source=f"{df.attrs.get('source', 'unknown')}; KDJ={source}",
+        bar_date=latest_bar_date(df),
+        data_quality=str(df.attrs.get("data_quality", "OHLC validation passed")),
+    )
+
+
 def classify_frame(
     tv_symbol: str,
     yahoo: str,
@@ -1612,6 +1682,8 @@ def scan(
     excluded: list[str] = []
     errors: list[str] = []
     sections: dict[str, list[Candidate]] = {DENSE: [], PULL20: [], PULL60: []}
+    if timeframe == "daily":
+        sections[DAILY_J_LT_ZERO] = []
     if timeframe == "weekly":
         sections[WEEKLY_J_LT_ZERO] = []
     tasks: list[tuple[str, str, str]] = []
@@ -1687,6 +1759,17 @@ def scan(
                 elif verified_kdj is not None:
                     kdj_fallback = True
                 rows_count += 1
+                if timeframe == "daily" and market == "crypto":
+                    daily_candidate = daily_j_lt_zero_candidate(
+                        tv_symbol,
+                        provider_symbol,
+                        market,
+                        ind,
+                        source=kdj_source,
+                        kdj_fallback=kdj_fallback,
+                    )
+                    if daily_candidate is not None:
+                        sections[DAILY_J_LT_ZERO].append(daily_candidate)
                 if timeframe == "weekly":
                     weekly_candidate = weekly_j_lt_zero_candidate(
                         tv_symbol,
@@ -1714,6 +1797,8 @@ def scan(
                 missing.append(tv_symbol)
                 errors.append(f"{tv_symbol}->{provider_symbol}: {type(exc).__name__}: {exc}")
     allowed_sections = [DENSE] if crypto_dense_only else [DENSE, PULL20, PULL60]
+    if timeframe == "daily":
+        allowed_sections.insert(0, DAILY_J_LT_ZERO)
     if timeframe == "weekly":
         allowed_sections.insert(0, WEEKLY_J_LT_ZERO)
     for key in list(sections):
@@ -1877,6 +1962,41 @@ def self_test() -> None:
     tradingview_missing = apply_tradingview_kdj(weekly_test, None, required=True)
     assert weekly_j_lt_zero_candidate("SSE:561980", "561980.SS", "china", tradingview_missing) is None
     tradingview_negative = apply_tradingview_kdj(weekly_test, (-5.0, -8.0), required=True)
+    daily_candidate = daily_j_lt_zero_candidate("COINBASE:TESTUSD", "TEST-USD", "crypto", tradingview_negative)
+    assert daily_candidate is not None and daily_candidate.kind == DAILY_J_LT_ZERO
+    assert daily_candidate.score == 85
+    assert daily_candidate.kdj_weight_cap == KDJ_MAX_BONUS
+    assert daily_j_lt_zero_candidate("COINBASE:TESTUSD", "TEST-USD", "crypto", tradingview_positive) is None
+
+    parity_frame = ind.copy()
+    parity_frame.loc[parity_frame.index[-2], "low"] = 125.0
+    parity_frame.loc[parity_frame.index[-1], ["open", "high", "low", "close"]] = [121.5, 122.0, 119.8, 121.0]
+    parity_frame.loc[parity_frame.index[-1], ["SMA20", "EMA20"]] = [120.0, 121.0]
+    parity_frame.loc[parity_frame.index[-1], ["SMA60", "EMA60"]] = [110.0, 111.0]
+    parity_frame.loc[parity_frame.index[-1], ["SMA120", "EMA120"]] = [100.0, 101.0]
+    parity_frame.loc[parity_frame.index[-1], "ATR"] = 2.0
+    parity_frame.loc[parity_frame.index[-2], "J"] = -10.0
+    parity_frame.loc[parity_frame.index[-1], "J"] = -5.0
+    parity_candidates = classify_frame(
+        "COINBASE:TESTUSD",
+        "TEST-USD",
+        "crypto",
+        parity_frame,
+        Thresholds(),
+        crypto_dense_only=False,
+        timeframe="daily",
+    )
+    assert any(candidate.kind == PULL20 for candidate in parity_candidates)
+    dense_only_candidates = classify_frame(
+        "COINBASE:TESTUSD",
+        "TEST-USD",
+        "crypto",
+        parity_frame,
+        Thresholds(),
+        crypto_dense_only=True,
+        timeframe="daily",
+    )
+    assert not any(candidate.kind in {PULL20, PULL60} for candidate in dense_only_candidates)
     weekly_candidate = weekly_j_lt_zero_candidate("NASDAQ:TEST", "TEST", "america", tradingview_negative)
     assert weekly_candidate is not None and weekly_candidate.kind == WEEKLY_J_LT_ZERO
     assert weekly_candidate.score == 65

@@ -14,6 +14,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from market_scan_local import (
+    DAILY_J_LT_ZERO,
     DENSE,
     FORMULA_VERSION,
     INDICATOR_SPEC,
@@ -36,10 +37,11 @@ WATCHLIST = ROOT / "symbols_watchlist.json"
 CRYPTO = ROOT / "symbols_crypto.json"
 
 SECTION_LABELS = {
+    DAILY_J_LT_ZERO: "\u65e5\u7ebfJ<0\u5173\u6ce8",
     WEEKLY_J_LT_ZERO: "周线J<0高权重",
     DENSE: "均线密集",
-    PULL20: "回踩20日均线",
-    PULL60: "回踩60日均线",
+    PULL20: "\u56de\u8e29 MA/EMA20",
+    PULL60: "\u56de\u8e29 MA/EMA60",
 }
 
 MACD_LABELS = {
@@ -273,6 +275,10 @@ def weekly_j_lt_zero_rows(
     return sorted(unique.values(), key=sort_key)[:max_items]
 
 
+def daily_crypto_j_lt_zero_rows(crypto: dict[str, object], max_items: int) -> list[dict[str, object]]:
+    return result_rows(crypto, [DAILY_J_LT_ZERO])[:max_items]
+
+
 def missing_text(result: dict[str, object]) -> str:
     missing = result.get("missing_symbols") or []
     if not missing:
@@ -431,6 +437,18 @@ def weekly_priority_html(rows: list[dict[str, object]]) -> str:
     return html_text.replace(old_description, new_description)
 
 
+def daily_crypto_priority_html(rows: list[dict[str, object]]) -> str:
+    return f"""
+      <section style="margin-top:22px;background:#eff6ff;border:2px solid #3b82f6;border-radius:10px;padding:14px;">
+        <h2 style="font-size:18px;margin:0 0 8px;color:#1e40af;">\u52a0\u5bc6\u65e5\u7ebf KDJ J&lt;0 \u5173\u6ce8</h2>
+        <div style="font-size:13px;color:#1e40af;line-height:1.55;margin-bottom:10px;">
+          \u72ec\u7acb\u626b\u63cf\u5168\u90e8\u52a0\u5bc6\u6807\u7684\uff0c\u4e0d\u8981\u6c42\u540c\u65f6\u6ee1\u8db3\u5747\u7ebf\u5bc6\u96c6\u6216\u56de\u8e29\u6761\u4ef6\uff1b\u53ef\u80fd\u4e0e\u4e0b\u65b9\u5e38\u89c4\u5019\u9009\u91cd\u590d\u3002
+        </div>
+        {cards_html(rows)}
+      </section>
+    """
+
+
 
 def build_fix_notice() -> tuple[str, str, str]:
     now = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
@@ -490,14 +508,15 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
     timeframe = "weekly" if report_type == "weekly" else "daily"
     th = Thresholds(max_items_per_section=max_items)
     watch = scan(WATCHLIST, timeframe, th, crypto_dense_only=False)
-    crypto = scan(CRYPTO, timeframe, th, crypto_dense_only=True)
+    crypto = scan(CRYPTO, timeframe, th, crypto_dense_only=False)
     now = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
     report_name = zh_report_name(report_type)
     timeframe_name = zh_timeframe(report_type)
     subject = f"TradingView策略{report_name}｜{timeframe_name}｜{now} 北京时间"
 
     watch_rows = result_rows(watch, [DENSE, PULL20, PULL60])
-    crypto_rows = result_rows(crypto, [DENSE])
+    crypto_rows = result_rows(crypto, [DENSE, PULL20, PULL60])
+    daily_crypto_priority_rows = daily_crypto_j_lt_zero_rows(crypto, max_items) if report_type == "daily" else []
     weekly_priority_rows = weekly_j_lt_zero_rows(watch, crypto, max_items) if report_type == "weekly" else []
     total_weekly_kdj_weight = KDJ_MAX_BONUS + WEEKLY_J_LT_ZERO_EXTRA_BONUS
 
@@ -507,14 +526,14 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
             "2. 自选列表：均线密集需同时满足 ATR 压缩和六线跨度占比，且J值越小越加分。",
             "3. 回踩20周与60周均线并列，J值越小权重越高。",
             f"4. MACD约占15%辅助权重，最高±{MACD_MAX_SCORE}分：DIF识别±4、柱体共振再±3、正式确认再±5；1周内全分，2至3周半分，超过3周只显示不计分。",
-            "5. 加密列表的常规候选目前只看均线密集；周线J<0仍会进入置顶名单。",
+            "5. \u52a0\u5bc6\u5217\u8868\u4e0e\u81ea\u9009\u5217\u8868\u4f7f\u7528\u76f8\u540c\u5e38\u89c4\u89c4\u5219\uff1a\u5747\u7ebf\u5bc6\u96c6\u3001\u56de\u8e2920\u3001\u56de\u8e2960\uff1b\u5468\u7ebfJ<0\u4ecd\u8fdb\u5165\u7f6e\u9876\u540d\u5355\u3002",
         ]
     else:
         priority_lines = [
-            f"1. 自选列表：均线密集需同时满足 ATR 压缩和六线跨度占比；J<20按深度加分，J<0时KDJ最高 +{KDJ_MAX_BONUS} 分。",
-            "2. 回踩20日与60日均线并列；J值权重同上，若J值向上勾头再加15分。",
-            f"3. MACD约占15%辅助权重，最高±{MACD_MAX_SCORE}分：DIF识别±4、柱体共振再±3、正式确认再±5；3日内全分，4至7日半分，超过7日只显示不计分。",
-            "4. 加密列表：目前只看均线密集；密集后J<0作为加分项。",
+            "1. \u52a0\u5bc6\u65e5\u7ebfJ<0\u72ec\u7acb\u7f6e\u9876\u626b\u63cf\uff0c\u4e0d\u8981\u6c42\u540c\u65f6\u6ee1\u8db3\u5747\u7ebf\u5bc6\u96c6\u6216\u56de\u8e29\u3002",
+            f"2. \u81ea\u9009\u4e0e\u52a0\u5bc6\u5217\u8868\u5747\u626b\u63cf\u5747\u7ebf\u5bc6\u96c6\uff1bJ<20\u6309\u6df1\u5ea6\u52a0\u5206\uff0cJ<0\u65f6KDJ\u6700\u9ad8 +{KDJ_MAX_BONUS} \u5206\u3002",
+            "3. \u81ea\u9009\u4e0e\u52a0\u5bc6\u5217\u8868\u5747\u626b\u63cf\u56de\u8e2920\u65e5\u4e0e60\u65e5\u5747\u7ebf\uff1bJ\u503c\u6743\u91cd\u540c\u4e0a\uff0c\u82e5J\u503c\u5411\u4e0a\u52fe\u5934\u518d\u52a015\u5206\u3002",
+            f"4. MACD\u4f5c\u4e3a\u8f85\u52a9\u6743\u91cd\uff0c\u6700\u9ad8\u00b1{MACD_MAX_SCORE}\u5206\uff1aDIF\u8bc6\u522b\u00b14\u3001\u67f1\u4f53\u5171\u632f\u518d\u00b13\u3001\u6b63\u5f0f\u786e\u8ba4\u518d\u00b15\uff1b3\u65e5\u5185\u5168\u5206\uff0c4\u81f37\u65e5\u534a\u5206\uff0c\u8d85\u8fc77\u65e5\u53ea\u663e\u793a\u4e0d\u8ba1\u5206\u3002",
         ]
 
     if report_type == "weekly":
@@ -551,9 +570,11 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
             f"周线 KDJ J<0 关注（正式最高 +{total_weekly_kdj_weight}，备用最高 +{KDJ_FALLBACK_MAX_BONUS}，正式优先）",
             weekly_priority_rows,
         ))
+    else:
+        plain_lines.extend(plain_candidates("\u52a0\u5bc6\u65e5\u7ebf KDJ J<0 \u5173\u6ce8\uff08\u72ec\u7acb\u626b\u63cf\uff09", daily_crypto_priority_rows))
     plain_lines.extend(plain_candidates("自选列表候选", watch_rows))
     plain_lines.append(f"加密列表：数据返回 {crypto.get('rows_count')}/{crypto.get('symbols_count')}；未返回/数据不足：{missing_text(crypto)}")
-    plain_lines.extend(plain_candidates("加密列表均线密集", crypto_rows))
+    plain_lines.extend(plain_candidates("\u52a0\u5bc6\u5217\u8868\u5019\u9009\uff08\u5747\u7ebf\u5bc6\u96c6/\u56de\u8e2920/\u56de\u8e2960\uff09", crypto_rows))
 
     plain_lines.append(f"\u4e25\u683c\u6a21\u5f0f\u6392\u9664\uff08\u81ea\u9009\uff09\uff1a{excluded_text(watch)}")
     plain_lines.append(f"\u4e25\u683c\u6a21\u5f0f\u6392\u9664\uff08\u52a0\u5bc6\uff09\uff1a{excluded_text(crypto)}")
@@ -585,6 +606,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
 
     priority_html_items = "".join(f"<li>{esc(item[3:])}</li>" for item in priority_lines)
     weekly_priority_section = weekly_priority_html(weekly_priority_rows) if report_type == "weekly" else ""
+    daily_crypto_priority_section = daily_crypto_priority_html(daily_crypto_priority_rows) if report_type == "daily" else ""
 
     precision_html = f'<div style="background:#ecfdf3;border:1px solid #abefc6;border-radius:10px;margin-top:12px;padding:12px 16px;color:#05603a;font-size:13px;line-height:1.6;"><strong>\u7cbe\u5ea6\u7248\u672c {FORMULA_VERSION}</strong><br>{esc(INDICATOR_SPEC)}<br>\u4ec5\u5df2\u6536\u76d8K\u7ebf\uff5c\u666e\u901a\u80a1\u7968/\u6307\u6570Yahoo repair=True\uff5cA\u80a1ETF\u524d\u590d\u6743/\u62c6\u5206\u6821\u6b63+\u65b0\u6d6a\u6536\u76d8\u8865\u9f50\uff5c\u52a0\u5bc6\u8d27\u5e01\u6307\u5b9a\u4ea4\u6613\u6240\u5b98\u65b9API</div>'
     html_body = f"""<!doctype html>
@@ -605,9 +627,10 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
       </div>
 
       {weekly_priority_section}
+      {daily_crypto_priority_section}
       {precision_html}
       {section_html("自选列表候选", watch, watch_rows)}
-      {section_html("加密列表均线密集", crypto, crypto_rows)}
+      {section_html("\u52a0\u5bc6\u5217\u8868\u5019\u9009\uff08\u5747\u7ebf\u5bc6\u96c6/\u56de\u8e2920/\u56de\u8e2960\uff09", crypto, crypto_rows)}
       {error_html}
 
       <div style="margin-top:22px;background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:13px 15px;color:#9a3412;font-size:13px;line-height:1.6;">
