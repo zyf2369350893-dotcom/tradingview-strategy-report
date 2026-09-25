@@ -6,6 +6,7 @@ This repo contains a GitHub Actions workflow for the TradingView strategy report
 
 - Daily report: Beijing time 09:10 every day.
 - Weekly report: Beijing time 09:25, Monday.
+- Monthly report: Beijing time 10:10 on the first day of each month.
 
 ## Required GitHub Secrets
 
@@ -17,7 +18,7 @@ Add these in GitHub: Settings -> Secrets and variables -> Actions -> New reposit
 - SMTP_PASSWORD
 - SMTP_TLS optional, default true
 - MAIL_FROM
-- MAIL_TO optional, default zyf18236610022@qq.com
+- MAIL_TO (required; report recipient)
 
 For QQ Mail, use the SMTP authorization code, not the normal login password.
 Common QQ settings:

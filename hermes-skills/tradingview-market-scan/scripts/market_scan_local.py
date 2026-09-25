@@ -60,6 +60,13 @@ PULL20 = "\u56de\u8e2920"
 PULL60 = "\u56de\u8e2960"
 DAILY_J_LT_ZERO = "\u65e5\u7ebfJ<0"
 WEEKLY_J_LT_ZERO = "\u5468\u7ebfJ<0"
+MONTHLY_J_LT_ZERO = "\u6708\u7ebfJ<0"
+VEGAS_C_ABOVE = "Vegas_C_ABOVE"
+VEGAS_C_NEW = "Vegas_C_NEW"
+VEGAS_C_NEAR_PCT = 1.0
+MAX_HISTORY_BARS = 20000
+VEGAS_HISTORY_BARS = MAX_HISTORY_BARS
+VEGAS_MIN_BARS = 677
 
 KDJ_MAX_BONUS = 35
 WEEKLY_J_LT_ZERO_EXTRA_BONUS = 15
@@ -86,6 +93,15 @@ WEEKLY_PRIORITY_BASE_SCORE = 30
 WEEKLY_KDJ_MIN_SCORE = 25
 WEEKLY_KDJ_DEPTH_MAX_SCORE = 20
 WEEKLY_KDJ_HOOK_SCORE = 5
+MONTHLY_J_BASE_SCORE = 30
+MONTHLY_J_DEPTH_MAX_SCORE = 20
+MONTHLY_J_HOOK_SCORE = 5
+MONTHLY_KDJ_MAX_BONUS = 10
+MONTHLY_KDJ_HOOK_BONUS = 5
+MONTHLY_MACD_IDENTIFICATION_SCORE = 4
+MONTHLY_MACD_RESONANCE_SCORE = 3
+MONTHLY_MACD_CONFIRMATION_SCORE = 8
+MONTHLY_MACD_MAX_SCORE = 15
 MACD_PIVOT_LEFT = 5
 MACD_PIVOT_RIGHT = 2
 MACD_MIN_BARS = 5
@@ -246,9 +262,12 @@ class Candidate:
     bar_date: str = ""
     bar_status: str = "confirmed"
     data_quality: str = "OHLC validation passed"
+    vegas_ema576: float | None = None
+    vegas_ema676: float | None = None
+    vegas_gap_pct: float | None = None
 
     def sort_tuple(self) -> tuple[int, int, float, float]:
-        kind_score = {DAILY_J_LT_ZERO: -1, WEEKLY_J_LT_ZERO: -1, DENSE: 0, PULL20: 1, PULL60: 1}.get(self.kind, 9)
+        kind_score = {VEGAS_C_NEW: -3, VEGAS_C_ABOVE: -2, DAILY_J_LT_ZERO: -1, WEEKLY_J_LT_ZERO: -1, MONTHLY_J_LT_ZERO: -1, DENSE: 0, PULL20: 1, PULL60: 1}.get(self.kind, 9)
         density = self.density if self.density is not None else 999.0
         j_value = self.j if self.j is not None else 999.0
         return (kind_score, -self.score, j_value, density)
@@ -294,7 +313,8 @@ def tradingview_kdj_columns(timeframe: str) -> list[str]:
     base = ["Stoch.K", "Stoch.D", "Stoch.K[1]", "Stoch.D[1]"]
     if timeframe == "daily":
         return base
-    return [f"{column}|1W" for column in base]
+    interval = {"weekly": "1W", "monthly": "1M"}.get(timeframe, "1W")
+    return [f"{column}|{interval}" for column in base]
 
 
 def kdj_from_stoch_values(
@@ -563,6 +583,37 @@ def aggregate_weekly(df: pd.DataFrame, market: str) -> pd.DataFrame:
     return weekly.loc[weekly.index <= pd.Timestamp(last_completed_end)].copy()
 
 
+def aggregate_monthly(df: pd.DataFrame, market: str, now_utc: datetime | None = None) -> pd.DataFrame:
+    """Build calendar-month bars from daily OHLCV and keep completed months only."""
+    if df.empty:
+        return df.copy()
+    month_end = pd.offsets.MonthEnd()
+    monthly = df.resample(month_end, label="right", closed="right").agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    })
+    monthly["_bar_end_date"] = df["close"].resample(month_end, label="right", closed="right").apply(
+        lambda values: values.index.max() if not values.empty else pd.NaT
+    )
+    monthly = monthly.dropna(subset=["open", "high", "low", "close"])
+    current = now_utc or datetime.now(timezone.utc)
+    if market == "crypto":
+        effective_date = current.astimezone(timezone.utc).date()
+    else:
+        timezone_name, safe_close = MARKET_SESSIONS.get(
+            market, ("America/New_York", clock_time(18, 0))
+        )
+        local = current.astimezone(ZoneInfo(timezone_name))
+        effective_date = local.date()
+        if local.time() >= safe_close:
+            effective_date += timedelta(days=1)
+    first_current_month = pd.Timestamp(effective_date.replace(day=1))
+    return monthly.loc[monthly.index < first_current_month].copy()
+
+
 def latest_bar_date(df: pd.DataFrame) -> str:
     value = df["_bar_end_date"].iloc[-1] if "_bar_end_date" in df.columns else df.index[-1]
     return pd.Timestamp(value).date().isoformat()
@@ -656,6 +707,8 @@ def finalize_crypto_frame(
         df = df.tail(bars).copy()
     if timeframe == "weekly" and "_bar_end_date" not in df.columns:
         df["_bar_end_date"] = df.index + pd.Timedelta(days=6)
+    if timeframe == "monthly" and "_bar_end_date" not in df.columns:
+        df["_bar_end_date"] = df.index + pd.offsets.MonthEnd(0)
     df.attrs["source"] = source
     df.attrs["data_quality"] = f"official venue OHLCV; {confirmation}; OHLC envelope passed; venue wicks preserved"
     return df
@@ -663,14 +716,30 @@ def finalize_crypto_frame(
 
 def fetch_binance_crypto(symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
     instrument = official_crypto_id(symbol)
-    interval = "1d" if timeframe == "daily" else "1w"
-    params = urllib.parse.urlencode({
-        "symbol": instrument,
-        "interval": interval,
-        "timeZone": "0",
-        "limit": min(1000, max(200, bars + 3)),
-    })
-    rows = fetch_json(f"https://data-api.binance.vision/api/v3/klines?{params}")
+    interval = {"daily": "1d", "weekly": "1w", "monthly": "1M"}[timeframe]
+    rows_by_time: dict[int, list[Any]] = {}
+    start_time = 0
+    for _ in range(math.ceil(bars / 1000) + 2):
+        params = urllib.parse.urlencode({
+            "symbol": instrument,
+            "interval": interval,
+            "timeZone": "0",
+            "startTime": start_time,
+            "limit": 1000,
+        })
+        batch = fetch_json(f"https://data-api.binance.vision/api/v3/klines?{params}")
+        if not isinstance(batch, list) or not batch:
+            break
+        for row in batch:
+            if isinstance(row, list) and len(row) >= 7:
+                rows_by_time[int(row[0])] = row
+        latest_time = max(int(row[0]) for row in batch if isinstance(row, list) and row)
+        if len(batch) < 1000:
+            break
+        start_time = latest_time + 1
+        if len(rows_by_time) >= bars:
+            break
+    rows = list(rows_by_time.values())
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     confirmed = [row for row in rows if isinstance(row, list) and len(row) >= 7 and int(row[6]) < now_ms]
     df = crypto_frame_from_rows(confirmed, (0, 1, 2, 3, 4, 5))
@@ -685,7 +754,7 @@ def fetch_binance_crypto(symbol: str, timeframe: str, bars: int) -> pd.DataFrame
 
 def fetch_bitget_crypto(symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
     instrument = official_crypto_id(symbol)
-    interval = "1Dutc" if timeframe == "daily" else "1Wutc"
+    interval = {"daily": "1Dutc", "weekly": "1Wutc", "monthly": "1M"}[timeframe]
     params = urllib.parse.urlencode({
         "symbol": instrument,
         "granularity": interval,
@@ -694,10 +763,54 @@ def fetch_bitget_crypto(symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
     payload = fetch_json(f"https://api.bitget.com/api/v2/spot/market/candles?{params}")
     if str(payload.get("code")) != "00000":
         raise ValueError(f"Bitget API error {payload.get('code')}: {payload.get('msg')}")
-    duration_ms = (86400 if timeframe == "daily" else 604800) * 1000
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    rows_by_time: dict[int, list[Any]] = {}
     rows = payload.get("data") or []
-    confirmed = [row for row in rows if isinstance(row, list) and len(row) >= 6 and int(row[0]) + duration_ms <= now_ms]
+    for row in rows:
+        if isinstance(row, list) and len(row) >= 6:
+            rows_by_time[int(row[0])] = row
+    cursor = min(rows_by_time) - 1 if rows_by_time else None
+    for _ in range(max(1, math.ceil(bars / 200) + 2)):
+        if cursor is None or len(rows_by_time) >= bars:
+            break
+        history_params = urllib.parse.urlencode({
+            "symbol": instrument,
+            "granularity": interval,
+            "endTime": cursor,
+            "limit": 200,
+        })
+        history = fetch_json(
+            f"https://api.bitget.com/api/v2/spot/market/history-candles?{history_params}"
+        )
+        if str(history.get("code")) != "00000":
+            raise ValueError(f"Bitget history API error {history.get('code')}: {history.get('msg')}")
+        older = history.get("data") or []
+        if not older:
+            break
+        valid_older = [row for row in older if isinstance(row, list) and len(row) >= 6]
+        if not valid_older:
+            break
+        oldest = min(int(row[0]) for row in valid_older)
+        for row in valid_older:
+            rows_by_time[int(row[0])] = row
+        if oldest >= cursor:
+            break
+        cursor = oldest - 1
+        if len(valid_older) < 200:
+            break
+        time.sleep(0.05)
+    rows = list(rows_by_time.values())
+    confirmed = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 6:
+            continue
+        start = pd.Timestamp(int(row[0]), unit="ms", tz="UTC")
+        if timeframe == "monthly":
+            end = start + pd.offsets.MonthBegin(1)
+        else:
+            end = start + pd.Timedelta(days=1 if timeframe == "daily" else 7)
+        if end.timestamp() * 1000 <= now_ms:
+            confirmed.append(row)
     df = crypto_frame_from_rows(confirmed, (0, 1, 2, 3, 4, 5))
     return finalize_crypto_frame(
         df,
@@ -710,7 +823,7 @@ def fetch_bitget_crypto(symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
 
 def fetch_okx_crypto(symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
     instrument = official_crypto_id(symbol)
-    interval = "1Dutc" if timeframe == "daily" else "1Wutc"
+    interval = {"daily": "1Dutc", "weekly": "1Wutc", "monthly": "1Mutc"}[timeframe]
     requested = bars + 3
     rows_by_time: dict[int, list[Any]] = {}
     cursor: int | None = None
@@ -750,7 +863,7 @@ def fetch_okx_crypto(symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
 
 def fetch_coinbase_crypto(symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
     instrument = official_crypto_id(symbol)
-    needed_days = bars + 10 if timeframe == "daily" else bars * 7 + 14
+    needed_days = MAX_HISTORY_BARS if timeframe == "daily" else bars * (32 if timeframe == "monthly" else 7) + 14
     end = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     rows_by_time: dict[int, list[Any]] = {}
     max_pages = math.ceil(needed_days / 299) + 2
@@ -774,7 +887,9 @@ def fetch_coinbase_crypto(symbol: str, timeframe: str, bars: int) -> pd.DataFram
         time.sleep(0.12)
     daily = crypto_frame_from_rows(list(rows_by_time.values()), (0, 3, 2, 1, 4, 5), "s")
     daily = drop_unconfirmed_rows(daily, "crypto")
-    df = aggregate_weekly(daily, "crypto") if timeframe == "weekly" else daily
+    df = aggregate_weekly(daily, "crypto") if timeframe == "weekly" else (
+        aggregate_monthly(daily, "crypto") if timeframe == "monthly" else daily
+    )
     return finalize_crypto_frame(
         df,
         timeframe,
@@ -787,7 +902,7 @@ def fetch_coinbase_crypto(symbol: str, timeframe: str, bars: int) -> pd.DataFram
 
 def fetch_bitstamp_crypto(symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
     instrument = official_crypto_id(symbol)
-    needed_days = bars + 10 if timeframe == "daily" else bars * 7 + 14
+    needed_days = MAX_HISTORY_BARS if timeframe == "daily" else bars * (32 if timeframe == "monthly" else 7) + 14
     rows_by_time: dict[int, dict[str, Any]] = {}
     cursor_end: int | None = None
     max_pages = math.ceil(needed_days / 1000) + 2
@@ -825,7 +940,9 @@ def fetch_bitstamp_crypto(symbol: str, timeframe: str, bars: int) -> pd.DataFram
         "volume": [row["volume"] for row in ordered],
     }, index=index))
     daily = drop_unconfirmed_rows(daily, "crypto")
-    df = aggregate_weekly(daily, "crypto") if timeframe == "weekly" else daily
+    df = aggregate_weekly(daily, "crypto") if timeframe == "weekly" else (
+        aggregate_monthly(daily, "crypto") if timeframe == "monthly" else daily
+    )
     return finalize_crypto_frame(
         df,
         timeframe,
@@ -948,7 +1065,7 @@ def fetch_sse_etf(symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
 
     ticker = symbol.split(":", 1)[1]
     local_now = datetime.now(ZoneInfo("Asia/Shanghai"))
-    history_days = 365 * (3 if timeframe == "daily" else 12)
+    history_days = 365 * (30 if timeframe == "daily" else (20 if timeframe == "monthly" else 12))
     start_date = (local_now.date() - timedelta(days=history_days)).strftime("%Y%m%d")
     end_date = local_now.date().strftime("%Y%m%d")
     raw: pd.DataFrame | None = None
@@ -1019,6 +1136,9 @@ def fetch_sse_etf(symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
     if timeframe == "weekly":
         frame = aggregate_weekly(frame, "china")
         validate_ohlcv(frame)
+    elif timeframe == "monthly":
+        frame = aggregate_monthly(frame, "china")
+        validate_ohlcv(frame)
     if len(frame) > bars:
         frame = frame.tail(bars).copy()
 
@@ -1042,7 +1162,7 @@ def fetch_ohlcv(yahoo: str, timeframe: str, bars: int, market: str) -> pd.DataFr
     # Weekly bars are deliberately aggregated from repaired daily bars. This
     # makes the week boundary explicit and avoids opaque provider aggregation.
     interval = "1d"
-    periods = ["3y", "2y", "1y", "6mo", "3mo"] if timeframe == "daily" else ["10y", "5y", "3y", "1y", "6mo"]
+    periods = ["max"] if timeframe == "daily" else ["20y", "15y", "10y", "5y", "3y", "1y", "6mo"] if timeframe == "monthly" else ["10y", "5y", "3y", "1y", "6mo"]
     last_error: Exception | None = None
     for attempt in range(3):
         for period in periods:
@@ -1062,8 +1182,18 @@ def fetch_ohlcv(yahoo: str, timeframe: str, bars: int, market: str) -> pd.DataFr
                 df = normalize_ohlcv(df)
                 df = drop_unconfirmed_rows(df, market)
                 validate_ohlcv(df)
+                if timeframe == "daily" and len(df) > 1:
+                    expected_minimum = max(20, int((df.index[-1] - df.index[0]).days * 0.25))
+                    if len(df) < expected_minimum:
+                        raise ValueError(
+                            f"incomplete daily history from Yahoo: {len(df)} bars over "
+                            f"{(df.index[-1] - df.index[0]).days} days"
+                        )
                 if timeframe == "weekly":
                     df = aggregate_weekly(df, market)
+                    validate_ohlcv(df)
+                elif timeframe == "monthly":
+                    df = aggregate_monthly(df, market)
                     validate_ohlcv(df)
                 if not df.empty:
                     if len(df) > bars:
@@ -1077,8 +1207,18 @@ def fetch_ohlcv(yahoo: str, timeframe: str, bars: int, market: str) -> pd.DataFr
                 df = fetch_yahoo_chart(yahoo, period)
                 df = drop_unconfirmed_rows(df, market)
                 validate_ohlcv(df)
+                if timeframe == "daily" and len(df) > 1:
+                    expected_minimum = max(20, int((df.index[-1] - df.index[0]).days * 0.25))
+                    if len(df) < expected_minimum:
+                        raise ValueError(
+                            f"incomplete daily history from Yahoo chart: {len(df)} bars over "
+                            f"{(df.index[-1] - df.index[0]).days} days"
+                        )
                 if timeframe == "weekly":
                     df = aggregate_weekly(df, market)
+                    validate_ohlcv(df)
+                elif timeframe == "monthly":
+                    df = aggregate_monthly(df, market)
                     validate_ohlcv(df)
                 if not df.empty:
                     if len(df) > bars:
@@ -1108,16 +1248,17 @@ def fetch_instrument_ohlcv(
     return fetch_ohlcv(provider_symbol, timeframe, bars, market)
 
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def add_indicators(df: pd.DataFrame, timeframe: str = "daily") -> pd.DataFrame:
     out = df.copy()
     out.attrs.update(df.attrs)
     close = out["close"]
     out["SMA20"] = close.rolling(20).mean()
     out["SMA60"] = close.rolling(60).mean()
-    out["SMA120"] = close.rolling(120).mean()
     out["EMA20"] = ema(close, 20)
     out["EMA60"] = ema(close, 60)
-    out["EMA120"] = ema(close, 120)
+    if timeframe != "monthly":
+        out["SMA120"] = close.rolling(120).mean()
+        out["EMA120"] = ema(close, 120)
     out["ATR"] = rma(true_range(out), 14)
 
     lowest_low = out["low"].rolling(KDJ_N).min()
@@ -1132,6 +1273,55 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["MACD_DEA"] = ema(out["MACD_DIF"], 9)
     out["MACD_HIST"] = out["MACD_DIF"] - out["MACD_DEA"]
     return out
+
+
+def classify_vegas_long_channel(
+    tv_symbol: str,
+    provider_symbol: str,
+    market: str,
+    df: pd.DataFrame,
+) -> list[Candidate]:
+    """Find confirmed daily closes above the Vegas third-channel upper edge."""
+    if len(df) < VEGAS_MIN_BARS:
+        return []
+    ema576 = ema(df["close"], 576)
+    ema676 = ema(df["close"], 676)
+    row, prev = df.iloc[-1], df.iloc[-2]
+    close = clean_float(row.get("close"))
+    prev_close = clean_float(prev.get("close"))
+    line576 = clean_float(ema576.iloc[-1])
+    line676 = clean_float(ema676.iloc[-1])
+    prev_lines = [clean_float(ema576.iloc[-2]), clean_float(ema676.iloc[-2])]
+    prev_top = max(float(value) for value in prev_lines if value is not None) if any(value is not None for value in prev_lines) else None
+    if None in (close, prev_close, line576, line676) or close <= 0:
+        return []
+    top = max(float(line576), float(line676))
+    gap_pct = (float(close) / top - 1.0) * 100.0
+    if gap_pct <= 0:
+        return []
+    change = (float(close) / float(prev_close) - 1.0) * 100.0 if prev_close else None
+    fresh = prev_top is not None and float(prev_close) <= prev_top and float(close) > top
+    common = dict(
+        symbol=tv_symbol, yahoo=provider_symbol, name=tv_symbol.split(":", 1)[-1],
+        market=market, close=float(close), change=change, density=gap_pct,
+        tags=["Vegas C上方"] + (["当日刚站上", "距上沿≤1%"] if fresh and gap_pct <= VEGAS_C_NEAR_PCT else []),
+        score=0,
+        source=str(df.attrs.get("source", "unknown")), bar_date=latest_bar_date(df),
+        data_quality=str(df.attrs.get("data_quality", "OHLC validation passed")),
+        vegas_ema576=float(line576), vegas_ema676=float(line676), vegas_gap_pct=gap_pct,
+    )
+    candidates = [Candidate(
+        kind=VEGAS_C_ABOVE,
+        reason=f"收盘站在 Vegas 第三通道上沿上方；EMA576={float(line576):.6g}，EMA676={float(line676):.6g}，距上沿 +{gap_pct:.2f}%",
+        **common,
+    )]
+    if fresh and gap_pct <= VEGAS_C_NEAR_PCT:
+        candidates.append(Candidate(
+            kind=VEGAS_C_NEW,
+            reason=f"今日收盘由通道内/下方站上 Vegas 第三通道上沿；距上沿 +{gap_pct:.2f}%（标注阈值 {VEGAS_C_NEAR_PCT:.1f}%）",
+            **common,
+        ))
+    return candidates
 
 
 def kdj_note(j: float | None, prev_j: float | None) -> tuple[str, bool]:
@@ -1151,7 +1341,7 @@ def kdj_note(j: float | None, prev_j: float | None) -> tuple[str, bool]:
 
 def _macd_freshness_score(raw_score: int, age: int, timeframe: str) -> int:
     """Apply the agreed daily/weekly signal-age decay to the MACD score."""
-    full_bars, half_bars = (1, 3) if timeframe == "weekly" else (3, 7)
+    full_bars, half_bars = (1, 3) if timeframe == "weekly" else (2, 4) if timeframe == "monthly" else (3, 7)
     if age <= full_bars:
         return raw_score
     if age <= half_bars:
@@ -1193,6 +1383,9 @@ def recent_macd_divergence(
     the confirmation window upgrades an identified signal to confirmed.
     Hidden divergence is intentionally excluded from scoring.
     """
+    if timeframe == "monthly":
+        pivot_left, pivot_right = 3, 1
+        min_bars, max_bars, confirmation_window = 3, 60, 4
     n = len(df)
     required = {"high", "low", "close", "MACD_DIF", "MACD_DEA", "MACD_HIST"}
     if n < pivot_left + pivot_right + 2 or not required.issubset(df.columns):
@@ -1320,7 +1513,7 @@ def recent_macd_divergence(
     if not events:
         return "", 0
 
-    display_bars = 8 if timeframe == "weekly" else 15
+    display_bars = 6 if timeframe == "monthly" else 8 if timeframe == "weekly" else 15
     recent_events: list[tuple[int, dict[str, Any]]] = []
     for event in events:
         signal_idx = int(event["confirmed"] if event["confirmed"] is not None else event["recognition"])
@@ -1496,6 +1689,160 @@ def daily_j_lt_zero_candidate(
     )
 
 
+def monthly_j_lt_zero_candidate(
+    tv_symbol: str,
+    provider_symbol: str,
+    market: str,
+    df: pd.DataFrame,
+    source: str = "custom-rma-local",
+) -> Candidate | None:
+    """Build a monthly oversold watch item without requiring 60 months of history."""
+    if len(df) < 20:
+        return None
+    row, prev = df.iloc[-1], df.iloc[-2]
+    close = clean_float(row.get("close"))
+    j = clean_float(row.get("J"))
+    if close is None or j is None or j >= 0:
+        return None
+    prev_j = clean_float(prev.get("J"))
+    note, hook = kdj_note(j, prev_j)
+    dif, dea = clean_float(row.get("MACD_DIF")), clean_float(row.get("MACD_DEA"))
+    macd = None if dif is None or dea is None else ("DIF>=DEA" if dif >= dea else "DIF<DEA")
+    macd_div, macd_score = recent_macd_divergence(df, timeframe="monthly")
+    kdj_score = min(MONTHLY_J_DEPTH_MAX_SCORE, max(0, round(-j)))
+    if hook:
+        kdj_score += MONTHLY_J_HOOK_SCORE
+    tags = ["J<0"]
+    side = macd_divergence_side(macd_div)
+    if side:
+        tags.append(f"MACD_{side}_DIV")
+    prev_close = clean_float(prev.get("close"))
+    return Candidate(
+        symbol=tv_symbol,
+        yahoo=provider_symbol,
+        name=tv_symbol.split(":", 1)[-1],
+        market=market,
+        close=close,
+        change=(close / prev_close - 1) * 100 if prev_close else None,
+        density=None,
+        kind=MONTHLY_J_LT_ZERO,
+        reason=(
+            f"月线KDJ J={j:.1f}<0；低位深度/拐头 +{kdj_score}/"
+            f"{MONTHLY_J_DEPTH_MAX_SCORE + MONTHLY_J_HOOK_SCORE}；MACD {macd_div or '未发现近期背离'}"
+        ),
+        tags=tags,
+        j=j,
+        prev_j=prev_j,
+        macd=macd,
+        macd_divergence=macd_div,
+        macd_divergence_score=macd_score,
+        kdj_weight_cap=MONTHLY_J_DEPTH_MAX_SCORE + MONTHLY_J_HOOK_SCORE,
+        score=clamp_score(MONTHLY_J_BASE_SCORE + kdj_score + macd_score),
+        kdj_note=note,
+        source=f"{df.attrs.get('source', 'unknown')}; KDJ={source}",
+        bar_date=latest_bar_date(df),
+        data_quality=str(df.attrs.get("data_quality", "OHLC validation passed")),
+    )
+
+
+def classify_monthly_frame(
+    tv_symbol: str,
+    provider_symbol: str,
+    market: str,
+    df: pd.DataFrame,
+    th: Thresholds,
+    kdj_source: str = "custom-rma-local",
+) -> list[Candidate]:
+    """Monthly counterpart: 20-month pullbacks when available; 4-line density and 60-month pullbacks need 60 bars."""
+    if len(df) < 20:
+        return []
+    row, prev = df.iloc[-1], df.iloc[-2]
+    close, high, low = (clean_float(row.get(key)) for key in ("close", "high", "low"))
+    prev_low = clean_float(prev.get("low"))
+    atr = clean_float(row.get("ATR"))
+    keys = ("SMA20", "EMA20", "SMA60", "EMA60")
+    values = [clean_float(row.get(key)) for key in keys]
+    if close is None or high is None or low is None or atr is None or atr <= 0 or any(v is None for v in values[:2]):
+        return []
+    ma20, ema20 = (float(v) for v in values[:2])
+    group20 = (min(ma20, ema20), max(ma20, ema20))
+    has_60m = values[2] is not None and values[3] is not None
+    group60 = (min(float(values[2]), float(values[3])), max(float(values[2]), float(values[3]))) if has_60m else None
+    lines = [ma20, ema20, *([float(values[2]), float(values[3])] if has_60m else [])]
+    density = (max(lines) - min(lines)) / atr
+    width_pct = (max(lines) - min(lines)) / close
+    price_dist = 0.0 if min(lines) <= close <= max(lines) else min(abs(close - min(lines)), abs(close - max(lines))) / atr
+    j, prev_j = clean_float(row.get("J")), clean_float(prev.get("J"))
+    note, j_hook = kdj_note(j, prev_j)
+    kdj_bonus = kdj_j_bonus(j, max_bonus=MONTHLY_KDJ_MAX_BONUS)
+    macd_div, macd_div_score = recent_macd_divergence(df, timeframe="monthly")
+    dif, dea = clean_float(row.get("MACD_DIF")), clean_float(row.get("MACD_DEA"))
+    macd = None if dif is None or dea is None else ("DIF>=DEA" if dif >= dea else "DIF<DEA")
+    prev_close = clean_float(prev.get("close"))
+    change = (close / prev_close - 1) * 100 if prev_close else None
+    prev_ma20 = clean_float(prev.get("SMA20"))
+    prev_ema20 = clean_float(prev.get("EMA20"))
+    long_trend = bool(group60 and group20[0] > group60[1] and close > group60[1])
+    short_trend = close > group20[1] and prev_ma20 is not None and prev_ema20 is not None and ma20 > prev_ma20 and ema20 > prev_ema20
+    trend = long_trend if group60 else short_trend
+    tags: list[str] = []
+    if j is not None and j < 0:
+        tags.append("J<0")
+    if macd_divergence_side(macd_div):
+        tags.append(f"MACD_{macd_divergence_side(macd_div)}_DIV")
+    common = dict(
+        symbol=tv_symbol, yahoo=provider_symbol, name=tv_symbol.split(":", 1)[-1],
+        market=market, close=close, change=change, density=density, tags=tags,
+        j=j, prev_j=prev_j, macd=macd, macd_divergence=macd_div,
+        macd_divergence_score=macd_div_score, kdj_weight_cap=MONTHLY_KDJ_MAX_BONUS,
+        kdj_note=note, source=f"{df.attrs.get('source', 'unknown')}; KDJ={kdj_source}",
+        bar_date=latest_bar_date(df), data_quality=str(df.attrs.get("data_quality", "OHLC validation passed")),
+    )
+    candidates: list[Candidate] = []
+    if (
+        has_60m
+        and
+        close > group20[1]
+        and density <= th.dense_atr
+        and width_pct <= th.dense_width_pct
+        and price_dist <= th.dense_price_atr
+    ):
+        compression_score = max(0, round(25 * (1 - density / th.dense_atr)))
+        proximity_score = max(0, round(10 * (1 - price_dist / th.dense_price_atr)))
+        trend_score = 40 if long_trend else 25 if short_trend else 20
+        score = clamp_score(trend_score + compression_score + proximity_score + kdj_bonus + macd_div_score)
+        candidates.append(Candidate(
+            kind=DENSE,
+            reason=f"20/60月四线跨度 {density:.2f}ATR/{width_pct*100:.1f}%；收盘价高于20月均线组",
+            score=score, **common,
+        ))
+
+    if trend:
+        def pullback_candidate(kind: str, period: int, group: tuple[float, float]) -> Candidate | None:
+            band = min(atr * th.pullback_approach_atr, group[1] * th.pullback_approach_pct)
+            near = low <= group[1] + band
+            intact = low >= group[0] - atr * th.pullback_break_low_atr and close >= group[0] - atr * th.pullback_break_close_atr
+            first_near = prev_low is not None and prev_low > group[1] + band
+            touched = low <= group[1]
+            if not (near and intact and close <= group[1] and (first_near or touched)):
+                return None
+            zone_dist = 0.0 if group[0] <= close <= group[1] else min(abs(close-group[0]), abs(close-group[1])) / atr
+            setup_score = max(0, round(35 * (1 - min(1.0, zone_dist / max(th.pullback_approach_atr, 0.01)))))
+            score = clamp_score(40 + setup_score + kdj_bonus + (MONTHLY_KDJ_HOOK_BONUS if j_hook else 0) + macd_div_score)
+            return Candidate(
+                kind=kind,
+                reason=f"月线上升趋势；回踩 MA/EMA{period}月线区间 {group[0]:.2f}-{group[1]:.2f}；收盘距离 {zone_dist:.2f}ATR",
+                score=score, fresh_pullback=True, **common,
+            )
+        pullbacks = [pullback_candidate(PULL20, 20, group20)]
+        if group60 is not None:
+            pullbacks.append(pullback_candidate(PULL60, 60, group60))
+        for item in pullbacks:
+            if item is not None:
+                candidates.append(item)
+    return candidates
+
+
 def classify_frame(
     tv_symbol: str,
     yahoo: str,
@@ -1669,6 +2016,7 @@ def scan(
     crypto_dense_only: bool = False,
     bars: int = 420,
     allow_approximate_mappings: bool = False,
+    include_vegas: bool = False,
 ) -> dict[str, Any]:
     try:
         YF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1677,6 +2025,8 @@ def scan(
         pass
     symbols = load_symbols(symbol_file)
     requested = [symbol for tickers in symbols.values() for symbol in tickers]
+    if timeframe == "monthly" and bars == 420:
+        bars = 120
     rows_count = 0
     missing: list[str] = []
     excluded: list[str] = []
@@ -1684,8 +2034,13 @@ def scan(
     sections: dict[str, list[Candidate]] = {DENSE: [], PULL20: [], PULL60: []}
     if timeframe == "daily":
         sections[DAILY_J_LT_ZERO] = []
-    if timeframe == "weekly":
+    if timeframe == "monthly":
+        sections[MONTHLY_J_LT_ZERO] = []
+    elif timeframe == "weekly":
         sections[WEEKLY_J_LT_ZERO] = []
+    if timeframe == "daily" and include_vegas:
+        sections[VEGAS_C_ABOVE] = []
+        sections[VEGAS_C_NEW] = []
     tasks: list[tuple[str, str, str]] = []
     for market, tickers in symbols.items():
         tradingview_kdj, tradingview_kdj_sources, tradingview_errors = fetch_tradingview_kdj(market, tickers, timeframe)
@@ -1708,7 +2063,7 @@ def scan(
                 continue
             tasks.append((market, tv_symbol, provider_symbol))
 
-    workers = max(1, min(8, int(os.environ.get("TV_SCAN_WORKERS", "4"))))
+    workers = max(1, min(8, int(os.environ.get("TV_SCAN_WORKERS", "2"))))
     with ThreadPoolExecutor(max_workers=min(workers, max(1, len(tasks)))) as executor:
         futures = {
             executor.submit(fetch_instrument_ohlcv, tv_symbol, provider_symbol, timeframe, bars, market):
@@ -1721,7 +2076,12 @@ def scan(
                 df = future.result()
                 if df.empty:
                     raise ValueError("empty OHLCV")
-                ind = add_indicators(df)
+                if timeframe == "monthly" and len(df) < 20:
+                    excluded.append(f"{tv_symbol}: fewer than 20 completed monthly bars; monthly analysis skipped")
+                    continue
+                if timeframe == "monthly" and len(df) < 60:
+                    errors.append(f"{tv_symbol}: 20-month MA group available; 60-month MA group unavailable, so no four-line density or 60-month pullback scan")
+                ind = add_indicators(df, timeframe=timeframe)
                 formal_ind = ind.copy()
                 formal_j = clean_float(formal_ind.iloc[-1].get("J"))
                 verified_kdj = tradingview_kdj.get(tv_symbol)
@@ -1733,7 +2093,7 @@ def scan(
                         kdj_source = f"tradingview-kdj:{tv_symbol}"
                     else:
                         kdj_source = f"tradingview-kdj-fallback:{source_symbol}"
-                        if timeframe == "weekly":
+                        if timeframe in {"weekly", "monthly"}:
                             errors.append(
                                 f"KDJ备用：{tv_symbol} 使用 TradingView 同标的代码 {source_symbol}，"
                                 f"KDJ权重上限 +{KDJ_FALLBACK_MAX_BONUS} 分"
@@ -1741,17 +2101,12 @@ def scan(
                 else:
                     kdj_source = "yfinance-local-kdj-fallback"
                     local_j = clean_float(ind.iloc[-1].get("J"))
-                    if timeframe == "weekly" and local_j is None:
-                        if local_j is not None:
-                            errors.append(
-                                f"KDJ备用：{tv_symbol} 使用 Yahoo 本地周线KDJ，"
-                                f"KDJ权重上限 +{KDJ_FALLBACK_MAX_BONUS} 分"
-                            )
-                        else:
-                            errors.append(
-                                f"KDJ不足：{tv_symbol} 的 TradingView 与 Yahoo 周线KDJ均不可用，"
-                                "本期不计KDJ分"
-                            )
+                    if timeframe in {"weekly", "monthly"} and local_j is None:
+                        period_name = "月线" if timeframe == "monthly" else "周线"
+                        errors.append(
+                            f"KDJ不足：{tv_symbol} 的 TradingView 与 Yahoo {period_name}KDJ均不可用，"
+                            "本期不计KDJ分"
+                        )
                 if formal_j is not None:
                     ind = formal_ind
                     kdj_source = "custom-rma-local"
@@ -1770,6 +2125,18 @@ def scan(
                     )
                     if daily_candidate is not None:
                         sections[DAILY_J_LT_ZERO].append(daily_candidate)
+                    if include_vegas:
+                        if len(ind) < VEGAS_MIN_BARS:
+                            errors.append(
+                                f"Vegas C通道不足历史：{tv_symbol} 只有 {len(ind)} 根已收盘日K；"
+                                f"至少需要 {VEGAS_MIN_BARS} 根，跳过该指标分析"
+                            )
+                        else:
+                            vegas_candidates = classify_vegas_long_channel(
+                                tv_symbol, provider_symbol, market, ind,
+                            )
+                            sections[VEGAS_C_ABOVE].extend(candidate for candidate in vegas_candidates if candidate.kind == VEGAS_C_ABOVE)
+                            sections[VEGAS_C_NEW].extend(candidate for candidate in vegas_candidates if candidate.kind == VEGAS_C_NEW)
                 if timeframe == "weekly":
                     weekly_candidate = weekly_j_lt_zero_candidate(
                         tv_symbol,
@@ -1781,7 +2148,18 @@ def scan(
                     )
                     if weekly_candidate is not None:
                         sections[WEEKLY_J_LT_ZERO].append(weekly_candidate)
-                for cand in classify_frame(
+                if timeframe == "monthly":
+                    monthly_j = monthly_j_lt_zero_candidate(
+                        tv_symbol, provider_symbol, market, ind, source=kdj_source,
+                    )
+                    if monthly_j is not None:
+                        sections[MONTHLY_J_LT_ZERO].append(monthly_j)
+                    monthly_candidates = classify_monthly_frame(
+                        tv_symbol, provider_symbol, market, ind, th, kdj_source=kdj_source,
+                    )
+                else:
+                    monthly_candidates = []
+                regular_candidates = [] if timeframe == "monthly" else classify_frame(
                     tv_symbol,
                     provider_symbol,
                     market,
@@ -1791,7 +2169,8 @@ def scan(
                     timeframe=timeframe,
                     kdj_source=kdj_source,
                     kdj_fallback=kdj_fallback,
-                ):
+                )
+                for cand in monthly_candidates + regular_candidates:
                     sections.setdefault(cand.kind, []).append(cand)
             except Exception as exc:
                 missing.append(tv_symbol)
@@ -1799,7 +2178,11 @@ def scan(
     allowed_sections = [DENSE] if crypto_dense_only else [DENSE, PULL20, PULL60]
     if timeframe == "daily":
         allowed_sections.insert(0, DAILY_J_LT_ZERO)
-    if timeframe == "weekly":
+        if include_vegas:
+            allowed_sections[:0] = [VEGAS_C_NEW, VEGAS_C_ABOVE]
+    if timeframe == "monthly":
+        allowed_sections.insert(0, MONTHLY_J_LT_ZERO)
+    elif timeframe == "weekly":
         allowed_sections.insert(0, WEEKLY_J_LT_ZERO)
     for key in list(sections):
         if key not in allowed_sections:
@@ -1810,7 +2193,7 @@ def scan(
         "timeframe": timeframe,
         "source": "Equities/indices: Yahoo repaired; SSE ETFs: qfq/split-adjusted + Sina close; crypto: exact-venue official APIs; KDJ: custom RMA local primary, TradingView marked capped fallback only",
         "formula_version": FORMULA_VERSION,
-        "indicator_spec": INDICATOR_SPEC,
+        "indicator_spec": "KDJ(9,3,3,RMA); SMA/EMA(20,60); ATR(14,RMA); MACD(12,26,9,EMA)" if timeframe == "monthly" else INDICATOR_SPEC,
         "bar_policy": "confirmed bars only",
         "strict_source_policy": not allow_approximate_mappings,
         "generated_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds"),
@@ -1848,6 +2231,9 @@ def candidate_to_dict(c: Candidate) -> dict[str, Any]:
         "bar_date": c.bar_date,
         "bar_status": c.bar_status,
         "data_quality": c.data_quality,
+        "vegas_ema576": c.vegas_ema576,
+        "vegas_ema676": c.vegas_ema676,
+        "vegas_gap_pct": c.vegas_gap_pct,
     }
 
 
@@ -2045,7 +2431,7 @@ def self_test() -> None:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Scan watch universe using full OHLCV local recalculation.")
-    parser.add_argument("--timeframe", choices=["daily", "weekly"], default="daily")
+    parser.add_argument("--timeframe", choices=["daily", "weekly", "monthly"], default="daily")
     parser.add_argument("--symbols", type=Path, default=DEFAULT_SYMBOLS)
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     parser.add_argument("--json", action="store_true")
