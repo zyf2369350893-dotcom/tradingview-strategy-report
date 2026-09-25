@@ -17,7 +17,7 @@ Add these in GitHub: Settings -> Secrets and variables -> Actions -> New reposit
 - SMTP_PASSWORD
 - SMTP_TLS optional, default true
 - MAIL_FROM
-- MAIL_TO optional, default zyf18236610022@qq.com
+- MAIL_TO (required; report recipient)
 
 For QQ Mail, use the SMTP authorization code, not the normal login password.
 Common QQ settings:
@@ -33,3 +33,4 @@ Common QQ settings:
 
 After pushing this repo to GitHub, open Actions -> TradingView Strategy Email Report -> Run workflow.
 Choose dry_run=true first. If logs look good, run again with dry_run=false after SMTP secrets are configured.
+

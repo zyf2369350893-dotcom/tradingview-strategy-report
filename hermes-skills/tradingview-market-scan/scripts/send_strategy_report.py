@@ -20,9 +20,14 @@ from market_scan_local import (
     INDICATOR_SPEC,
     KDJ_FALLBACK_MAX_BONUS,
     KDJ_MAX_BONUS,
+    MONTHLY_J_LT_ZERO,
     MACD_MAX_SCORE,
     WEEKLY_MACD_MAX_SCORE,
     WEEKLY_PRIORITY_BASE_SCORE,
+    VEGAS_C_ABOVE,
+    VEGAS_C_NEW,
+    VEGAS_C_NEAR_PCT,
+    VEGAS_HISTORY_BARS,
     PULL20,
     PULL60,
     WEEKLY_J_LT_ZERO,
@@ -39,6 +44,9 @@ CRYPTO = ROOT / "symbols_crypto.json"
 SECTION_LABELS = {
     DAILY_J_LT_ZERO: "\u65e5\u7ebfJ<0\u5173\u6ce8",
     WEEKLY_J_LT_ZERO: "周线J<0高权重",
+    MONTHLY_J_LT_ZERO: "月线J<0观察",
+    VEGAS_C_ABOVE: "站上Vegas最长通道",
+    VEGAS_C_NEW: "刚站上且贴近Vegas最长通道",
     DENSE: "均线密集",
     PULL20: "\u56de\u8e29 MA/EMA20",
     PULL60: "\u56de\u8e29 MA/EMA60",
@@ -96,11 +104,11 @@ def esc(value: object) -> str:
 
 
 def zh_timeframe(report_type: str) -> str:
-    return "周线" if report_type == "weekly" else "日线"
+    return {"monthly": "月线", "weekly": "周线"}.get(report_type, "日线")
 
 
 def zh_report_name(report_type: str) -> str:
-    return "周报" if report_type == "weekly" else "日报"
+    return {"monthly": "月报", "weekly": "周报"}.get(report_type, "日报")
 
 
 def zh_kind(kind: object) -> str:
@@ -251,6 +259,18 @@ def result_rows(result: dict[str, object], sections: list[str]) -> list[dict[str
             out.append(candidate_to_dict(cand))
     return out
 
+
+def monthly_j_lt_zero_rows(
+    watch: dict[str, object], crypto: dict[str, object], max_items: int,
+) -> list[dict[str, object]]:
+    combined = result_rows(watch, [MONTHLY_J_LT_ZERO]) + result_rows(crypto, [MONTHLY_J_LT_ZERO])
+    unique: dict[str, dict[str, object]] = {}
+    for row in combined:
+        symbol = str(row.get("symbol") or "")
+        if symbol and symbol not in unique:
+            unique[symbol] = row
+    return sorted(unique.values(), key=lambda row: (-int(row.get("score") or 0), str(row.get("symbol") or "")))[:max_items]
+
 def weekly_j_lt_zero_rows(
     watch: dict[str, object],
     crypto: dict[str, object],
@@ -298,6 +318,14 @@ def plain_candidates(title: str, rows: list[dict[str, object]]) -> list[str]:
     if not rows:
         return lines + ["暂无符合条件标的", ""]
     for idx, row in enumerate(rows, 1):
+        if row.get("kind") in {VEGAS_C_ABOVE, VEGAS_C_NEW}:
+            lines.extend([
+                f"{idx}. {row.get('symbol')}｜收盘 {fmt_float(row.get('close'))}｜日涨跌 {fmt_pct(row.get('change'))}",
+                f"Vegas C通道上沿：EMA576 {fmt_float(row.get('vegas_ema576'))} / EMA676 {fmt_float(row.get('vegas_ema676'))}；距上沿 {fmt_pct(row.get('vegas_gap_pct'))}",
+                f"K线日期：{row.get('bar_date') or '-'}（完整日线收盘）｜数据源：{row.get('source') or '-'}",
+                "",
+            ])
+            continue
         parts = [
             f"{idx}. {row.get('symbol')}｜{zh_kind(row.get('kind'))}｜评分 {row.get('score')}",
             f"收盘 {fmt_float(row.get('close'))}｜涨跌 {fmt_pct(row.get('change'))}｜J {fmt_float(row.get('j'), 1)}",
@@ -337,6 +365,21 @@ def card_html(row: dict[str, object], idx: int) -> str:
     source = esc(row.get("source") or "-")
     quality = esc(row.get("data_quality") or "-")
     change_color = "#b42318" if str(change).startswith("-") else "#067647"
+    if row.get("kind") in {VEGAS_C_ABOVE, VEGAS_C_NEW}:
+        label_color = "#92400e" if row.get("kind") == VEGAS_C_NEW else "#1e40af"
+        label_text = "刚站上 · 临界附近" if row.get("kind") == VEGAS_C_NEW else "已站上"
+        return f"""
+          <div style="border:1px solid #e5e7eb;border-radius:8px;padding:14px;margin:10px 0;background:#fff;">
+            <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;">
+              <strong style="font-size:17px;color:#111827;">#{idx} {symbol}</strong>
+              <span style="background:#fffbeb;color:{label_color};border-radius:999px;padding:4px 9px;font-size:12px;font-weight:700;">{label_text}</span>
+            </div>
+            <div style="margin-top:8px;font-size:13px;color:#374151;">收盘 {close}（日涨跌 <span style="color:{change_color};">{change}</span>）</div>
+            <div style="margin-top:7px;font-size:13px;color:#374151;">第三通道 EMA576：{esc(fmt_float(row.get('vegas_ema576')))}｜EMA676：{esc(fmt_float(row.get('vegas_ema676')))}</div>
+            <div style="margin-top:5px;font-size:13px;color:{label_color};font-weight:700;">收盘距通道上沿：{esc(fmt_pct(row.get('vegas_gap_pct')))}</div>
+            <div style="margin-top:7px;font-size:12px;color:#6b7280;">{esc(row.get('bar_date') or '-')} 完整日线收盘｜数据源：{esc(row.get('source') or '-')}</div>
+          </div>
+        """
     return f"""
       <div style="border:1px solid #e5e7eb;border-radius:8px;padding:14px 14px 12px;margin:10px 0;background:#ffffff;">
         <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
@@ -449,6 +492,33 @@ def daily_crypto_priority_html(rows: list[dict[str, object]]) -> str:
     """
 
 
+def vegas_crypto_sections_html(above_rows: list[dict[str, object]], new_rows: list[dict[str, object]]) -> str:
+    return f"""
+      <section style="margin-top:22px;background:#fff7ed;border:2px solid #fb923c;border-radius:10px;padding:14px;">
+        <h2 style="font-size:18px;margin:0 0 8px;color:#9a3412;">刚站上 Vegas 最长通道 · 临界附近</h2>
+        <div style="font-size:13px;color:#9a3412;line-height:1.55;margin-bottom:10px;">使用第三通道上沿（EMA576/EMA676）：昨日收盘未站上、今日完整日线收盘站上，且收盘距上沿不超过 {VEGAS_C_NEAR_PCT:.1f}%。这里只提示技术状态，不代表牛市确认。</div>
+        {cards_html(new_rows)}
+      </section>
+      <section style="margin-top:22px;background:#eff6ff;border:1px solid #93c5fd;border-radius:10px;padding:14px;">
+        <h2 style="font-size:18px;margin:0 0 8px;color:#1e40af;">已站上 Vegas 最长通道的加密币</h2>
+        <div style="font-size:13px;color:#1e40af;line-height:1.55;margin-bottom:10px;">收盘价高于第三通道两条线的上沿；按距上沿由近到远排列。上方临界币种会在本表重复出现并特别标注。</div>
+        {cards_html(above_rows)}
+      </section>
+    """
+
+
+def monthly_priority_html(rows: list[dict[str, object]]) -> str:
+    return f"""
+      <section style="margin-top:22px;background:#fffbeb;border:2px solid #f59e0b;border-radius:10px;padding:14px;">
+        <h2 style="font-size:18px;margin:0 0 8px;color:#92400e;">月线 KDJ J&lt;0 观察</h2>
+        <div style="font-size:13px;color:#92400e;line-height:1.55;margin-bottom:10px;">
+          仅作月线超跌观察；单独列出不代表反转或买入信号。月线分析要求至少20根已收盘月K。
+        </div>
+        {cards_html(rows)}
+      </section>
+    """
+
+
 
 def build_fix_notice() -> tuple[str, str, str]:
     now = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
@@ -505,10 +575,15 @@ def build_fix_notice() -> tuple[str, str, str]:
 
 
 def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
-    timeframe = "weekly" if report_type == "weekly" else "daily"
+    timeframe = report_type if report_type in {"weekly", "monthly"} else "daily"
     th = Thresholds(max_items_per_section=max_items)
-    watch = scan(WATCHLIST, timeframe, th, crypto_dense_only=False)
-    crypto = scan(CRYPTO, timeframe, th, crypto_dense_only=False)
+    bars = 120 if timeframe == "monthly" else 420
+    crypto_bars = VEGAS_HISTORY_BARS if timeframe == "daily" else bars
+    watch = scan(WATCHLIST, timeframe, th, crypto_dense_only=False, bars=bars)
+    crypto = scan(
+        CRYPTO, timeframe, th, crypto_dense_only=False, bars=crypto_bars,
+        include_vegas=(timeframe == "daily"),
+    )
     now = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
     report_name = zh_report_name(report_type)
     timeframe_name = zh_timeframe(report_type)
@@ -516,11 +591,25 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
 
     watch_rows = result_rows(watch, [DENSE, PULL20, PULL60])
     crypto_rows = result_rows(crypto, [DENSE, PULL20, PULL60])
+    if report_type == "monthly":
+        month_labels = {DENSE: "20/60月四线均线密集", PULL20: "回踩20月均线组", PULL60: "回踩60月均线组"}
+        for row in watch_rows + crypto_rows:
+            row["kind"] = month_labels.get(str(row.get("kind")), row.get("kind"))
     daily_crypto_priority_rows = daily_crypto_j_lt_zero_rows(crypto, max_items) if report_type == "daily" else []
+    vegas_above_rows = result_rows(crypto, [VEGAS_C_ABOVE]) if report_type == "daily" else []
+    vegas_new_rows = result_rows(crypto, [VEGAS_C_NEW]) if report_type == "daily" else []
     weekly_priority_rows = weekly_j_lt_zero_rows(watch, crypto, max_items) if report_type == "weekly" else []
+    monthly_priority_rows = monthly_j_lt_zero_rows(watch, crypto, max_items) if report_type == "monthly" else []
     total_weekly_kdj_weight = KDJ_MAX_BONUS + WEEKLY_J_LT_ZERO_EXTRA_BONUS
 
-    if report_type == "weekly":
+    if report_type == "monthly":
+        priority_lines = [
+            "1. 月线保留原来的均线密集和上涨趋势回踩逻辑，只使用 MA/EMA20月、60月四条线。",
+            "2. 至少20根已收盘月K才分析；20至59根只看20月线回踩及KDJ/MACD，60月线不足时不判四线密集或60月线回踩。",
+            "3. 月度排序以趋势和形态为主：趋势最高40分、形态最高35分、KDJ最高10分（回踩时J向上拐头另加5分）、MACD背离/确认调整最高±15分。",
+            "4. 月线MACD背离分数按新鲜度递减，月线KDJ J<0单独观察；评分只用于月报内部排序，不与日/周评分横向比较。",
+        ]
+    elif report_type == "weekly":
         priority_lines = [
             f"1. 周线J<0：TradingView正式KDJ最高 +{total_weekly_kdj_weight} 分；无数据时自动备用且最高 +{KDJ_FALLBACK_MAX_BONUS} 分，正式数据优先置顶。",
             "2. 自选列表：均线密集需同时满足 ATR 压缩和六线跨度占比，且J值越小越加分。",
@@ -534,6 +623,7 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
             f"2. \u81ea\u9009\u4e0e\u52a0\u5bc6\u5217\u8868\u5747\u626b\u63cf\u5747\u7ebf\u5bc6\u96c6\uff1bJ<20\u6309\u6df1\u5ea6\u52a0\u5206\uff0cJ<0\u65f6KDJ\u6700\u9ad8 +{KDJ_MAX_BONUS} \u5206\u3002",
             "3. \u81ea\u9009\u4e0e\u52a0\u5bc6\u5217\u8868\u5747\u626b\u63cf\u56de\u8e2920\u65e5\u4e0e60\u65e5\u5747\u7ebf\uff1bJ\u503c\u6743\u91cd\u540c\u4e0a\uff0c\u82e5J\u503c\u5411\u4e0a\u52fe\u5934\u518d\u52a015\u5206\u3002",
             f"4. MACD\u4f5c\u4e3a\u8f85\u52a9\u6743\u91cd\uff0c\u6700\u9ad8\u00b1{MACD_MAX_SCORE}\u5206\uff1aDIF\u8bc6\u522b\u00b14\u3001\u67f1\u4f53\u5171\u632f\u518d\u00b13\u3001\u6b63\u5f0f\u786e\u8ba4\u518d\u00b15\uff1b3\u65e5\u5185\u5168\u5206\uff0c4\u81f37\u65e5\u534a\u5206\uff0c\u8d85\u8fc77\u65e5\u53ea\u663e\u793a\u4e0d\u8ba1\u5206\u3002",
+            "5. Vegas第三通道使用EMA576/EMA676；仅以完整日K收盘确认站上。昨日未站上、今日站上且距上沿≤1%时特别标注。",
         ]
 
     if report_type == "weekly":
@@ -547,11 +637,21 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
             "\u91d1\u53c9/\u7ed3\u6784\u7a81\u7834\u786e\u8ba4\u518d\u00b110\uff1b1\u5468\u5185\u5168\u5206\uff0c2\u81f33\u5468\u534a\u5206\uff0c\u8d85\u8fc73\u5468\u53ea\u6807\u6ce8\u4e0d\u8ba1\u5206\u3002"
         )
 
+    indicator_spec = (
+        "KDJ(9,3,3,RMA); SMA/EMA(20,60); ATR(14,RMA); MACD(12,26,9,EMA)"
+        if timeframe == "monthly" else
+        f"{INDICATOR_SPEC}; Vegas C-channel EMA(576,676)" if timeframe == "daily" else INDICATOR_SPEC
+    )
+    kdj_method_line = (
+        "KDJ使用完整月线OHLC按自定义RMA公式本地重算；J值用于低位观察及候选排序"
+        if timeframe == "monthly"
+        else "KDJ使用拆分/复权校正后的已收盘K线按自定义RMA公式重算；TradingView仅作缺数备用，最高 +15 分"
+    )
     precision_header = [
         f"\u7cbe\u5ea6\u7248\u672c\uff1a{FORMULA_VERSION}",
-        f"\u6307\u6807\u516c\u5f0f\uff1a{INDICATOR_SPEC}",
+        f"\u6307\u6807\u516c\u5f0f\uff1a{indicator_spec}",
         "\u53ea\u4f7f\u7528\u5df2\u6536\u76d8K\u7ebf\uff1b\u666e\u901a\u80a1\u7968/\u6307\u6570Yahoo repair=True\uff1bA\u80a1ETF\u524d\u590d\u6743/\u62c6\u5206\u6821\u6b63+\u65b0\u6d6a\u6536\u76d8\u8865\u9f50\uff1b\u52a0\u5bc6\u8d27\u5e01\u6307\u5b9a\u4ea4\u6613\u6240\u5b98\u65b9API\uff1b\u5f02\u5e38OHLC\u4e0d\u53c2\u4e0e\u7b5b\u9009",
-        "KDJ\u4f7f\u7528\u62c6\u5206/\u590d\u6743\u6821\u6b63\u540e\u7684\u5df2\u6536\u76d8K\u7ebf\u6309\u81ea\u5b9a\u4e49RMA\u516c\u5f0f\u91cd\u7b97\uff1bTradingView\u4ec5\u4f5c\u7f3a\u6570\u5907\u7528\uff0c\u6700\u9ad8 +15 \u5206",
+        kdj_method_line,
         "\u8bc4\u5206\u662f\u7b56\u7565\u6392\u5e8f\uff0c\u4e0d\u662f\u884c\u60c5\u6570\u636e\u7cbe\u5ea6",
     ]
     plain_lines = [*precision_header,
@@ -565,19 +665,24 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
         "",
         f"自选列表：数据返回 {watch.get('rows_count')}/{watch.get('symbols_count')}；未返回/数据不足：{missing_text(watch)}",
     ]
-    if report_type == "weekly":
+    if report_type == "monthly":
+        plain_lines.extend(plain_candidates("月线 KDJ J<0 观察（单独列表；不等同反转信号）", monthly_priority_rows))
+    elif report_type == "weekly":
         plain_lines.extend(plain_candidates(
             f"周线 KDJ J<0 关注（正式最高 +{total_weekly_kdj_weight}，备用最高 +{KDJ_FALLBACK_MAX_BONUS}，正式优先）",
             weekly_priority_rows,
         ))
     else:
         plain_lines.extend(plain_candidates("\u52a0\u5bc6\u65e5\u7ebf KDJ J<0 \u5173\u6ce8\uff08\u72ec\u7acb\u626b\u63cf\uff09", daily_crypto_priority_rows))
+        plain_lines.extend(plain_candidates("刚站上 Vegas 最长通道且贴近上沿（当日新突破；距上沿≤1%）", vegas_new_rows))
+        plain_lines.extend(plain_candidates("已站上 Vegas 最长通道的加密币（按距上沿由近到远）", vegas_above_rows))
     plain_lines.extend(plain_candidates("自选列表候选", watch_rows))
     plain_lines.append(f"加密列表：数据返回 {crypto.get('rows_count')}/{crypto.get('symbols_count')}；未返回/数据不足：{missing_text(crypto)}")
-    plain_lines.extend(plain_candidates("\u52a0\u5bc6\u5217\u8868\u5019\u9009\uff08\u5747\u7ebf\u5bc6\u96c6/\u56de\u8e2920/\u56de\u8e2960\uff09", crypto_rows))
+    candidate_title = "加密月线候选（20/60月均线密集及回踩）" if report_type == "monthly" else "\u52a0\u5bc6\u5217\u8868\u5019\u9009\uff08\u5747\u7ebf\u5bc6\u96c6/\u56de\u8e2920/\u56de\u8e2960\uff09"
+    plain_lines.extend(plain_candidates(candidate_title, crypto_rows))
 
-    plain_lines.append(f"\u4e25\u683c\u6a21\u5f0f\u6392\u9664\uff08\u81ea\u9009\uff09\uff1a{excluded_text(watch)}")
-    plain_lines.append(f"\u4e25\u683c\u6a21\u5f0f\u6392\u9664\uff08\u52a0\u5bc6\uff09\uff1a{excluded_text(crypto)}")
+    plain_lines.append(f"扫描排除或数据不足（自选）：{excluded_text(watch)}")
+    plain_lines.append(f"扫描排除或数据不足（加密）：{excluded_text(crypto)}")
     errors = list(watch.get("errors") or []) + list(crypto.get("errors") or [])
     if errors:
         plain_lines.append("数据备注：")
@@ -606,10 +711,12 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
 
     priority_html_items = "".join(f"<li>{esc(item[3:])}</li>" for item in priority_lines)
     weekly_priority_section = weekly_priority_html(weekly_priority_rows) if report_type == "weekly" else ""
+    monthly_priority_section = monthly_priority_html(monthly_priority_rows) if report_type == "monthly" else ""
     daily_crypto_priority_section = daily_crypto_priority_html(daily_crypto_priority_rows) if report_type == "daily" else ""
-    crypto_section_title = "\u52a0\u5bc6\u5217\u8868\u5019\u9009\uff08\u5747\u7ebf\u5bc6\u96c6/\u56de\u8e2920/\u56de\u8e2960\uff09"
+    vegas_crypto_section = vegas_crypto_sections_html(vegas_above_rows, vegas_new_rows) if report_type == "daily" else ""
+    crypto_section_title = "加密月线候选（20/60月均线密集及回踩）" if report_type == "monthly" else "\u52a0\u5bc6\u5217\u8868\u5019\u9009\uff08\u5747\u7ebf\u5bc6\u96c6/\u56de\u8e2920/\u56de\u8e2960\uff09"
 
-    precision_html = f'<div style="background:#ecfdf3;border:1px solid #abefc6;border-radius:10px;margin-top:12px;padding:12px 16px;color:#05603a;font-size:13px;line-height:1.6;"><strong>\u7cbe\u5ea6\u7248\u672c {FORMULA_VERSION}</strong><br>{esc(INDICATOR_SPEC)}<br>\u4ec5\u5df2\u6536\u76d8K\u7ebf\uff5c\u666e\u901a\u80a1\u7968/\u6307\u6570Yahoo repair=True\uff5cA\u80a1ETF\u524d\u590d\u6743/\u62c6\u5206\u6821\u6b63+\u65b0\u6d6a\u6536\u76d8\u8865\u9f50\uff5c\u52a0\u5bc6\u8d27\u5e01\u6307\u5b9a\u4ea4\u6613\u6240\u5b98\u65b9API</div>'
+    precision_html = f'<div style="background:#ecfdf3;border:1px solid #abefc6;border-radius:10px;margin-top:12px;padding:12px 16px;color:#05603a;font-size:13px;line-height:1.6;"><strong>\u7cbe\u5ea6\u7248\u672c {FORMULA_VERSION}</strong><br>{esc(indicator_spec)}<br>\u4ec5\u5df2\u6536\u76d8K\u7ebf\uff5c\u666e\u901a\u80a1\u7968/\u6307\u6570Yahoo repair=True\uff5cA\u80a1ETF\u524d\u590d\u6743/\u62c6\u5206\u6821\u6b63+\u65b0\u6d6a\u6536\u76d8\u8865\u9f50\uff5c\u52a0\u5bc6\u8d27\u5e01\u6307\u5b9a\u4ea4\u6613\u6240\u5b98\u65b9API</div>'
     html_body = f"""<!doctype html>
 <html>
   <body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,'Microsoft YaHei',sans-serif;color:#111827;">
@@ -628,7 +735,9 @@ def build_report(report_type: str, max_items: int) -> tuple[str, str, str]:
       </div>
 
       {weekly_priority_section}
+      {monthly_priority_section}
       {daily_crypto_priority_section}
+      {vegas_crypto_section}
       {precision_html}
       {section_html("自选列表候选", watch, watch_rows)}
       {section_html(crypto_section_title, crypto, crypto_rows)}
@@ -654,7 +763,7 @@ def send_email(subject: str, plain_body: str, html_body: str, dry_run: bool = Fa
     user = os.environ.get("SMTP_USER")
     password = os.environ.get("SMTP_PASSWORD")
     mail_from = os.environ.get("MAIL_FROM") or user
-    mail_to = os.environ.get("MAIL_TO") or "zyf18236610022@qq.com"
+    mail_to = os.environ.get("MAIL_TO")
     use_tls = os.environ.get("SMTP_TLS", "true").lower() != "false"
 
     if dry_run:
@@ -696,7 +805,7 @@ def send_email(subject: str, plain_body: str, html_body: str, dry_run: bool = Fa
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate and email strategy report.")
-    parser.add_argument("--report-type", choices=["daily", "weekly", "diagnostic"], default="daily")
+    parser.add_argument("--report-type", choices=["daily", "weekly", "monthly", "diagnostic"], default="daily")
     parser.add_argument("--max-items", type=int, default=30)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
@@ -714,3 +823,4 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
+
