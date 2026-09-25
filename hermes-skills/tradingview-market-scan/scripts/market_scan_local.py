@@ -66,7 +66,9 @@ VEGAS_C_NEW = "Vegas_C_NEW"
 VEGAS_C_NEAR_PCT = 1.0
 MAX_HISTORY_BARS = 20000
 VEGAS_HISTORY_BARS = MAX_HISTORY_BARS
-VEGAS_MIN_BARS = 677
+# Pine's recursive EMA initializes from the first available close, so only
+# two confirmed bars are needed for today's value and the previous-day cross check.
+VEGAS_MIN_BARS = 2
 
 KDJ_MAX_BONUS = 35
 WEEKLY_J_LT_ZERO_EXTRA_BONUS = 15
@@ -2129,7 +2131,7 @@ def scan(
                         if len(ind) < VEGAS_MIN_BARS:
                             errors.append(
                                 f"Vegas C通道不足历史：{tv_symbol} 只有 {len(ind)} 根已收盘日K；"
-                                f"至少需要 {VEGAS_MIN_BARS} 根，跳过该指标分析"
+                                f"至少需要 {VEGAS_MIN_BARS} 根已收盘日K，跳过该指标分析"
                             )
                         else:
                             vegas_candidates = classify_vegas_long_channel(
