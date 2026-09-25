@@ -20,7 +20,9 @@
     "NASDAQ:RDDT",
     "NASDAQ:SPCX",
     "NASDAQ:LUNR",
-    "NASDAQ:RKLB"
+    "NASDAQ:RKLB",
+    "AMEX:GLD",
+    "AMEX:SLV"
   ],
   "china": [
     "SSE:000001",
@@ -44,9 +46,5 @@
   "crypto": [
     "COINBASE:BTCUSD",
     "BINANCE:ZECU"
-  ],
-  "cfd": [
-    "OANDA:XAUUSD",
-    "FX:XAGUSD"
   ]
 }
