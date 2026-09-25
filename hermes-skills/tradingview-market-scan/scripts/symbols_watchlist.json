@@ -45,9 +45,6 @@
     "COINBASE:BTCUSD",
     "BINANCE:ZECU"
   ],
-  "futures": [
-    "CME:BTC1!"
-  ],
   "cfd": [
     "OANDA:XAUUSD",
     "FX:XAGUSD"
